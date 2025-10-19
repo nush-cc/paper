@@ -1,0 +1,94 @@
+# Python
+*.py[cod]
+*$py.class
+*.so
+__pycache__/
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
+
+# 虛擬環境
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+conda-env/
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# 數據集 (重要!)
+data/
+dataset/
+datasets/
+*.csv
+*.json
+*.txt
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# 訓練相關
+logs/
+runs/
+tensorboard/
+checkpoints/
+weights/
+*.pth
+*.pt
+*.ckpt
+*.pb
+*.onnx
+models/saved/
+experiments/
+
+# 輸出結果
+output/
+results/
+predictions/
+visualization/
+plots/
+
+# MLflow / Weights & Biases
+mlruns/
+wandb/
+
+# 測試與覆蓋率
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
+
+# 系統文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# 大型文件
+*.tar
+*.zip
+*.gz
+*.rar
+*.7z
