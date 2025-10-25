@@ -1,7 +1,7 @@
 """
-Baseline Models for Volatility Prediction
-Includes: Persistence, ARIMA, GARCH, Single GRU, Single LSTM
-For comparison with MODWT-MoE model
+Baseline Models for Volatility Prediction (Updated)
+使用與 MoE 相同的資料切分方式（75/10/15）
+Includes: Moving Average, GARCH, Single GRU, Single LSTM
 """
 
 import os
@@ -49,40 +49,7 @@ class SimpleVolatilityDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-# ==================== Baseline 1: Persistence (Naive) ====================
-# class PersistenceModel:
-#     """Naive baseline: tomorrow = today"""
-#
-#     def __init__(self):
-#         self.name = "Persistence (Naive)"
-#
-#     def predict(self, data):
-#         """Predict: next value = current value"""
-#         return data[:-1]  # Shift by 1
-#
-#     def evaluate(self, data):
-#         """Evaluate on data"""
-#         predictions = self.predict(data)
-#         targets = data[1:]
-#
-#         rmse = np.sqrt(mean_squared_error(targets, predictions))
-#         mae = mean_absolute_error(targets, predictions)
-#         r2 = r2_score(targets, predictions)
-#
-#         # Direction accuracy
-#         pred_direction = (predictions[1:] - predictions[:-1]) > 0
-#         true_direction = (targets[1:] - targets[:-1]) > 0
-#         direction_acc = np.mean(pred_direction == true_direction)
-#
-#         return {
-#             'rmse': rmse,
-#             'mae': mae,
-#             'r2': r2,
-#             'direction_acc': direction_acc
-#         }, predictions, targets
-
-
-# ==================== Baseline 2: Simple Moving Average ====================
+# ==================== Baseline 1: Moving Average ====================
 class MovingAverageModel:
     """Simple Moving Average baseline"""
 
@@ -122,7 +89,7 @@ class MovingAverageModel:
         }, predictions, targets
 
 
-# ==================== Baseline 3: GARCH(1,1) ====================
+# ==================== Baseline 2: GARCH(1,1) ====================
 class GARCHModel:
     """GARCH(1,1) model using arch library"""
 
@@ -142,9 +109,8 @@ class GARCHModel:
             # Rolling forecast
             predictions = []
             for i in range(len(test_returns)):
-                # Forecast 1-step ahead
                 forecast = self.model.forecast(horizon=1, reindex=False)
-                vol_forecast = np.sqrt(forecast.variance.values[-1, 0]) / 100  # Back to original scale
+                vol_forecast = np.sqrt(forecast.variance.values[-1, 0]) / 100
                 predictions.append(vol_forecast)
 
             return np.array(predictions)
@@ -158,9 +124,9 @@ class GARCHModel:
             return None
 
 
-# ==================== Baseline 4: Single GRU ====================
+# ==================== Baseline 3: Single GRU ====================
 class SingleGRU(nn.Module):
-    """Single GRU baseline (your original baseline)"""
+    """Single GRU baseline"""
 
     def __init__(self, input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
         super().__init__()
@@ -186,7 +152,7 @@ class SingleGRU(nn.Module):
         return self.fc(out)
 
 
-# ==================== Baseline 5: Single LSTM ====================
+# ==================== Baseline 4: Single LSTM ====================
 class SingleLSTM(nn.Module):
     """Single LSTM baseline"""
 
@@ -246,148 +212,153 @@ def evaluate_neural_network(model, loader, device):
     for X, y in loader:
         X, y = X.to(device), y.to(device)
         y_pred = model(X)
+
         all_preds.append(y_pred.cpu().numpy())
         all_targets.append(y.cpu().numpy())
 
-    all_preds = np.concatenate(all_preds).flatten()
-    all_targets = np.concatenate(all_targets).flatten()
+    predictions = np.concatenate(all_preds).flatten()
+    targets = np.concatenate(all_targets).flatten()
 
-    rmse = np.sqrt(mean_squared_error(all_targets, all_preds))
-    mae = mean_absolute_error(all_targets, all_preds)
-    r2 = r2_score(all_targets, all_preds)
+    rmse = np.sqrt(mean_squared_error(targets, predictions))
+    mae = mean_absolute_error(targets, predictions)
+    r2 = r2_score(targets, predictions)
 
-    # Direction accuracy
-    if len(all_preds) > 1:
-        pred_direction = (all_preds[1:] - all_preds[:-1]) > 0
-        true_direction = (all_targets[1:] - all_targets[:-1]) > 0
+    if len(predictions) > 1:
+        pred_direction = (predictions[1:] - predictions[:-1]) > 0
+        true_direction = (targets[1:] - targets[:-1]) > 0
         direction_acc = np.mean(pred_direction == true_direction)
     else:
         direction_acc = 0.0
 
-    return {
+    metrics = {
         'rmse': rmse,
         'mae': mae,
         'r2': r2,
         'direction_acc': direction_acc
-    }, all_preds, all_targets
+    }
+
+    return metrics, predictions, targets
 
 
-def train_neural_baseline(model, train_loader, test_loader, model_name,
-                          num_epochs=50, device=DEVICE):
-    """Train neural network baseline"""
+def train_neural_baseline(model, train_loader, val_loader, test_loader,
+                          model_name, num_epochs=50, patience=10, device=DEVICE):
+    """Train neural network baseline with early stopping"""
 
     print(f"\n{'='*80}")
-    print(f"🚀 Training {model_name}")
+    print(f"Training {model_name}")
     print(f"{'='*80}")
 
     model = model.to(device)
-    criterion = nn.HuberLoss(delta=1.0)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5
     )
 
-    best_rmse = float('inf')
+    best_val_loss = float('inf')
+    best_state = None
     patience_counter = 0
-    early_stop_patience = 15
-
-    print(f"📊 Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     for epoch in range(num_epochs):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        metrics, preds, targets = evaluate_neural_network(model, test_loader, device)
 
-        scheduler.step(metrics['rmse'])
+        # Validation
+        val_metrics, _, _ = evaluate_neural_network(model, val_loader, device)
+        val_loss = val_metrics['rmse']
 
-        if (epoch + 1) % 10 == 0:
+        scheduler.step(val_loss)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"Epoch [{epoch+1}/{num_epochs}] "
-                  f"Loss: {train_loss:.6f} | "
-                  f"RMSE: {metrics['rmse']:.6f} | "
-                  f"R²: {metrics['r2']:.6f}")
+                  f"Train Loss: {train_loss:.6f}, Val RMSE: {val_loss:.6f}")
 
-        if metrics['rmse'] < best_rmse:
-            best_rmse = metrics['rmse']
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = model.state_dict().copy()
             patience_counter = 0
-            best_state = model.state_dict()
         else:
             patience_counter += 1
-
-        if patience_counter >= early_stop_patience:
-            print(f"⚠️ Early stopping at epoch {epoch+1}")
-            break
+            if patience_counter >= patience:
+                print(f"⚠️ Early stopping at epoch {epoch+1}")
+                break
 
     # Load best model
     model.load_state_dict(best_state)
-    final_metrics, final_preds, final_targets = evaluate_neural_network(
+
+    # Final evaluation on test set
+    test_metrics, test_preds, test_targets = evaluate_neural_network(
         model, test_loader, device
     )
 
-    print(f"\n✅ Best RMSE: {final_metrics['rmse']:.6f}")
+    print(f"✅ Best Val RMSE: {best_val_loss:.6f}")
+    print(f"✅ Test RMSE: {test_metrics['rmse']:.6f}")
 
-    return model, final_metrics, final_preds, final_targets
+    return model, test_metrics, test_preds, test_targets
 
 
 # ==================== Main Baseline Evaluation ====================
-def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.8):
-    """Evaluate all baseline models"""
+def evaluate_all_baselines(df, vol_window=7, lookback=30,
+                           train_ratio=0.75, val_ratio=0.10):
+    """
+    Evaluate all baseline models
+    使用與 MoE 相同的 75/10/15 切分
+    """
 
     print("="*80)
-    print("📊 Baseline Models Evaluation")
+    print("📊 Baseline Models Evaluation (75/10/15 Split)")
     print("="*80)
 
-    # Prepare data
+    # Prepare data (與 MoE 完全相同的方式)
     df = df.copy()
     df['log_return'] = np.log(df['Close'] / df['Close'].shift(1))
-    df['volatility'] = df['log_return'].rolling(vol_window).std() * np.sqrt(252) * 100
-    df = df.dropna()
+    df['volatility'] = df['log_return'].rolling(vol_window).std() * np.sqrt(252) * 100  # 年化
+    df = df.dropna().reset_index(drop=True)
 
     volatility = df['volatility'].values
-    log_returns = df['log_return'].values[vol_window-1:]  # For GARCH
+    log_returns = df['log_return'].values[vol_window-1:]
 
     print(f"\n✅ Data: {len(volatility)} samples")
     print(f"   Mean: {volatility.mean():.4f}%, Std: {volatility.std():.4f}%")
 
-    # Split data
-    split_idx = int(len(volatility) * train_ratio)
-    train_vol = volatility[:split_idx]
-    test_vol = volatility[split_idx:]
-    train_returns = log_returns[:split_idx]
-    test_returns = log_returns[split_idx:]
+    # Split data (與 MoE 相同)
+    total_len = len(volatility)
+    train_split_idx = int(total_len * train_ratio)
+    val_split_idx = int(total_len * (train_ratio + val_ratio))
 
-    # Scale data for neural networks
+    train_vol = volatility[:train_split_idx]
+    val_vol = volatility[train_split_idx:val_split_idx]
+    test_vol = volatility[val_split_idx:]
+
+    train_returns = log_returns[:train_split_idx]
+    test_returns = log_returns[val_split_idx:]  # GARCH 不需要 val
+
+    print(f"\n📊 Data Split:")
+    print(f"   Train: {len(train_vol)} samples ({train_ratio*100:.0f}%)")
+    print(f"   Val:   {len(val_vol)} samples ({val_ratio*100:.0f}%)")
+    print(f"   Test:  {len(test_vol)} samples ({(1-train_ratio-val_ratio)*100:.0f}%)")
+
+    # Scale data for neural networks (只在 train 上 fit)
     scaler = StandardScaler()
     train_vol_scaled = scaler.fit_transform(train_vol.reshape(-1, 1)).flatten()
+    val_vol_scaled = scaler.transform(val_vol.reshape(-1, 1)).flatten()
     test_vol_scaled = scaler.transform(test_vol.reshape(-1, 1)).flatten()
 
-    # Create datasets for neural networks
+    # Create datasets
     train_dataset = SimpleVolatilityDataset(train_vol_scaled, window=lookback)
+    val_dataset = SimpleVolatilityDataset(val_vol_scaled, window=lookback)
     test_dataset = SimpleVolatilityDataset(test_vol_scaled, window=lookback)
 
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
     # Results storage
     results = {}
 
-    # ==================== Baseline 1: Persistence ====================
-    # print(f"\n{'='*80}")
-    # print("1️⃣ Evaluating Persistence Model")
-    # print(f"{'='*80}")
-    #
-    # persistence = PersistenceModel()
-    # metrics, preds, targets = persistence.evaluate(test_vol)
-    # results['Persistence'] = {
-    #     'model': None,
-    #     'metrics': metrics,
-    #     'predictions': preds,
-    #     'targets': targets
-    # }
-    # print(f"✅ RMSE: {metrics['rmse']:.4f}%, R²: {metrics['r2']:.6f}, "
-    #       f"Direction: {metrics['direction_acc']:.4f}")
-
-    # ==================== Baseline 2: Moving Average ====================
+    # ==================== Baseline 1: Moving Average ====================
     print(f"\n{'='*80}")
-    print("2️⃣ Evaluating Moving Average Model")
+    print("1️⃣ Evaluating Moving Average Model")
     print(f"{'='*80}")
 
     ma_model = MovingAverageModel(window=5)
@@ -401,9 +372,9 @@ def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.8):
     print(f"✅ RMSE: {metrics['rmse']:.4f}%, R²: {metrics['r2']:.6f}, "
           f"Direction: {metrics['direction_acc']:.4f}")
 
-    # ==================== Baseline 3: GARCH ====================
+    # ==================== Baseline 2: GARCH ====================
     print(f"\n{'='*80}")
-    print("3️⃣ Evaluating GARCH(1,1) Model")
+    print("2️⃣ Evaluating GARCH(1,1) Model")
     print(f"{'='*80}")
 
     try:
@@ -411,8 +382,8 @@ def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.8):
         garch_preds = garch_model.fit_predict(train_returns, test_returns)
 
         if garch_preds is not None:
-            # Convert volatility predictions to match test_vol
-            garch_preds = garch_preds * np.sqrt(252) * 100  # Annualize
+            # Annualize
+            garch_preds = garch_preds * np.sqrt(252) * 100
 
             # Align lengths
             min_len = min(len(garch_preds), len(test_vol))
@@ -448,10 +419,11 @@ def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.8):
     except Exception as e:
         print(f"⚠️ GARCH evaluation failed: {e}")
 
-    # ==================== Baseline 4: Single GRU ====================
+    # ==================== Baseline 3: Single GRU ====================
     gru_model = SingleGRU(input_size=1, hidden_size=64, num_layers=2, dropout=0.2)
     gru_model, metrics, preds_scaled, targets_scaled = train_neural_baseline(
-        gru_model, train_loader, test_loader, "Single GRU", num_epochs=50
+        gru_model, train_loader, val_loader, test_loader, "Single GRU",
+        num_epochs=50, patience=10
     )
 
     # Inverse transform
@@ -482,10 +454,11 @@ def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.8):
         'targets': targets
     }
 
-    # ==================== Baseline 5: Single LSTM ====================
+    # ==================== Baseline 4: Single LSTM ====================
     lstm_model = SingleLSTM(input_size=1, hidden_size=64, num_layers=2, dropout=0.2)
     lstm_model, metrics, preds_scaled, targets_scaled = train_neural_baseline(
-        lstm_model, train_loader, test_loader, "Single LSTM", num_epochs=50
+        lstm_model, train_loader, val_loader, test_loader, "Single LSTM",
+        num_epochs=50, patience=10
     )
 
     # Inverse transform
@@ -519,7 +492,7 @@ def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.8):
     return results, scaler
 
 
-# ==================== Comparison and Visualization ====================
+# ==================== Comparison ====================
 def compare_results(results, moe_results=None):
     """Compare all baseline results"""
 
@@ -527,7 +500,6 @@ def compare_results(results, moe_results=None):
     print("📊 BASELINE MODELS COMPARISON")
     print("="*80)
 
-    # Create comparison table
     models = list(results.keys())
 
     if moe_results is not None:
@@ -545,7 +517,7 @@ def compare_results(results, moe_results=None):
               f"{metrics['r2']:<10.6f} "
               f"{metrics['direction_acc']:<10.4f}")
 
-    # Find best model
+    # Find best models
     best_rmse_model = min(models, key=lambda m: results[m]['metrics']['rmse'])
     best_r2_model = max(models, key=lambda m: results[m]['metrics']['r2'])
     best_dir_model = max(models, key=lambda m: results[m]['metrics']['direction_acc'])
@@ -598,12 +570,15 @@ def plot_baseline_comparison(results):
 
     plt.tight_layout()
     plt.savefig('../results/baseline_comparison.png', dpi=300, bbox_inches='tight')
-    print("\n📊 Saved: ../rssults/baseline_comparison.png")
-    plt.show()
+    print("\n📊 Saved: ../results/baseline_comparison.png")
+    plt.close()
 
 
 # ==================== Main Execution ====================
 if __name__ == "__main__":
+    # Create results directory
+    os.makedirs('../results', exist_ok=True)
+
     # Load data
     print("📂 Loading data...")
     df = pd.read_csv("../dataset/USD_TWD.csv")
@@ -611,30 +586,27 @@ if __name__ == "__main__":
     df = df.sort_values("Date").reset_index(drop=True)
     print(f"✅ Loaded {len(df)} days of data\n")
 
-    # Evaluate all baselines
+    # Evaluate all baselines with 75/10/15 split
     results, scaler = evaluate_all_baselines(
         df,
         vol_window=7,
         lookback=30,
-        train_ratio=0.8
+        train_ratio=0.75,  # 與 MoE 相同
+        val_ratio=0.10     # 與 MoE 相同
     )
 
-    # If you have MoE results, add them here
+    # Add your MoE results here (手動輸入你的 MoE 最終結果)
     moe_results = {
         'model': None,
         'metrics': {
-            'rmse': 1.7614,
-            'mae': 0.5439,
-            'r2': 0.755151,
-            'direction_acc': 0.7686
+            'rmse': 2.3116,      # ← 填入你的 MoE Test RMSE
+            'mae': 0.6109,       # ← 填入你的 MoE Test MAE
+            'r2': 0.6552,        # ← 填入你的 MoE Test R²
+            'direction_acc': 0.7526  # ← 填入你的 MoE Test Direction Acc
         },
         'predictions': None,
         'targets': None
     }
-
-    print(f"✅ MoE RMSE: {moe_results['metrics']['rmse']:.4f}%")
-    print(f"✅ MoE R²: {moe_results['metrics']['r2']:.6f}")
-    print(f"✅ MoE Direction: {moe_results['metrics']['direction_acc']:.4f}")
 
     # Compare with MoE
     compare_results(results, moe_results=moe_results)
