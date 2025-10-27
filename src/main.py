@@ -20,7 +20,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 import pywt
-from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -217,7 +216,7 @@ class HighFreqExpert(nn.Module):
 class GatingNetwork(nn.Module):
     """Gating network to combine experts dynamically"""
 
-    def __init__(self, input_size=5, hidden_size=128, num_experts=3, dropout=0.1):
+    def __init__(self, input_size=5, hidden_size=64, num_experts=3, dropout=0.1):
         super().__init__()
         # 增加 hidden_size 從 64 → 128，給 Gating 更多學習容量
         # 降低 dropout 從 0.2 → 0.1，避免過度正則化
@@ -371,11 +370,12 @@ def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
         scalers[name] = scaler
         print(f"   ✅ {name}: Mean={scaler.mean_[0]:.4f}, Std={scaler.scale_[0]:.4f}")
 
-    # Scale targets using cA4_trend scaler
-    target_scaler = scalers['cA4_trend']
-    train_target_scaled = target_scaler.transform(train_volatility.reshape(-1, 1)).flatten()
+    # Scale targets
+    target_scaler = StandardScaler()
+    train_target_scaled = target_scaler.fit_transform(train_volatility.reshape(-1, 1)).flatten()
     val_target_scaled = target_scaler.transform(val_volatility.reshape(-1, 1)).flatten()
     test_target_scaled = target_scaler.transform(test_volatility.reshape(-1, 1)).flatten()
+    scalers['target'] = target_scaler
 
     # Step 6: 建立 Dataset 和 DataLoader
     print("\n📊 Step 6: Create datasets...")
@@ -468,8 +468,7 @@ def train_modwt_moe(train_loader, val_loader, test_loader, num_epochs=50,
         model.train()
         train_losses = []
 
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
-        for batch in train_pbar:
+        for batch in train_loader:
             e1 = batch['expert1'].to(device)
             e2 = batch['expert2'].to(device)
             e3 = batch['expert3'].to(device)
@@ -479,12 +478,10 @@ def train_modwt_moe(train_loader, val_loader, test_loader, num_epochs=50,
             output, weights, expert_preds = model(e1, e2, e3)
             loss = criterion(output, target)
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_losses.append(loss.item())
-            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
         avg_train_loss = np.mean(train_losses)
 
@@ -569,7 +566,6 @@ def train_modwt_moe(train_loader, val_loader, test_loader, num_epochs=50,
     print(f"\n✅ Training complete! Loaded best model from epoch {best_epoch}")
 
     return model, history, best_epoch
-
 
 # ==================== Evaluation Function ====================
 def evaluate(model, data_loader, device):
@@ -748,7 +744,7 @@ def save_results_to_csv(targets, predictions, gating_weights, expert_preds, scal
     """Save detailed results to CSV"""
 
     # Inverse transform
-    target_scaler = scalers['cA4_trend']
+    target_scaler = scalers['target']
     targets_original = target_scaler.inverse_transform(targets.reshape(-1, 1)).flatten()
     predictions_original = target_scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
 
@@ -919,7 +915,7 @@ if __name__ == "__main__":
     )
 
     # Inverse transform to original scale
-    target_scaler = scalers['cA4_trend']
+    target_scaler = scalers['target']
     test_preds_original = target_scaler.inverse_transform(test_preds.reshape(-1, 1)).flatten()
     test_targets_original = target_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
 
