@@ -599,10 +599,10 @@ if __name__ == "__main__":
     moe_results = {
         'model': None,
         'metrics': {
-            'rmse': 2.3116,      # ← 填入你的 MoE Test RMSE
-            'mae': 0.6109,       # ← 填入你的 MoE Test MAE
-            'r2': 0.6552,        # ← 填入你的 MoE Test R²
-            'direction_acc': 0.7526  # ← 填入你的 MoE Test Direction Acc
+            'rmse':1.9137,      # ← 填入你的 MoE Test RMSE
+            'mae': 0.3764,       # ← 填入你的 MoE Test MAE
+            'r2': 0.7107,        # ← 填入你的 MoE Test R²
+            'direction_acc': 0.8457  # ← 填入你的 MoE Test Direction Acc
         },
         'predictions': None,
         'targets': None

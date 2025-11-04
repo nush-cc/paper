@@ -1,15 +1,3 @@
-"""
-MODWT-MoE Volatility Prediction System (Improved Version)
-使用 modwtpy 套件 + 數據去中心化，解決 cD1 能量異常問題
-Split: 75% Train / 10% Validation / 15% Test
-
-主要改進：
-1. 使用 modwtpy 進行正確的 MODWT 分解
-2. 數據去中心化處理，解決 cD1 能量異常問題
-3. 分別對 Train/Val/Test 進行分解，完全避免資料洩漏
-4. 改進 Gating Network 輸入特徵
-"""
-
 import os
 import numpy as np
 import pandas as pd
@@ -639,6 +627,196 @@ def evaluate(model, data_loader, device):
 
     return metrics, predictions.flatten(), targets.flatten(), expert_preds, gating_weights
 
+def walk_forward_validation(df,
+                            vol_window=7,
+                            lookback=30,
+                            forecast_horizon=1,
+                            wavelet='db4',
+                            level=4,
+                            train_window=4000,
+                            test_window=500,
+                            step_size=500,
+                            num_epochs=50,
+                            batch_size=32,
+                            lr=0.001,
+                            use_robust_scaler=False,
+                            device=DEVICE):
+    """
+    Walk-Forward Validation for MODWT-MoE
+
+    參數:
+        df: 原始數據 DataFrame
+        train_window: 每個 fold 的訓練窗口大小 (天數)
+        test_window: 每個 fold 的測試窗口大小 (天數)
+        step_size: 每次滾動的步長 (天數)
+        num_epochs: 每個 fold 訓練多少 epoch
+        其他參數與原本相同
+
+    返回:
+        results_df: 包含所有 fold 結果的 DataFrame
+        all_predictions: 所有 fold 的預測結果
+        all_models: 所有訓練好的模型 (可選)
+    """
+
+    print("\n" + "=" * 80)
+    print("🔄 Walk-Forward Validation for MODWT-MoE")
+    print("=" * 80)
+    print(f"📊 Configuration:")
+    print(f"   Train Window: {train_window} days")
+    print(f"   Test Window: {test_window} days")
+    print(f"   Step Size: {step_size} days")
+    print(f"   Epochs per Fold: {num_epochs}")
+
+    # 計算可以做幾個 fold
+    total_len = len(df)
+    max_start = total_len - train_window - test_window
+    num_folds = max_start // step_size + 1
+
+    print(f"   Total Data: {total_len} days")
+    print(f"   Number of Folds: {num_folds}")
+    print("=" * 80)
+
+    all_results = []
+    all_predictions = []
+    all_models = []
+
+    for fold in range(num_folds):
+        fold_start_time = pd.Timestamp.now()
+
+        # 計算這個 fold 的時間範圍
+        train_start = fold * step_size
+        train_end = train_start + train_window
+        test_end = train_end + test_window
+
+        # 檢查是否超出範圍
+        if test_end > total_len:
+            print(f"\n⚠️  Fold {fold+1}: Insufficient data, skipping...")
+            break
+
+        print(f"\n{'='*80}")
+        print(f"🔹 Fold {fold+1}/{num_folds}")
+        print(f"{'='*80}")
+        print(f"   Train: Index {train_start:4d} to {train_end:4d} ({train_window} days)")
+        print(f"   Test:  Index {train_end:4d} to {test_end:4d} ({test_window} days)")
+
+        # 切分數據
+        fold_df = df.iloc[train_start:test_end].copy().reset_index(drop=True)
+
+        # 準備數據 (內部會再按 train_window/(train_window+test_window) 切分)
+        train_ratio = train_window / (train_window + test_window)
+
+        try:
+            train_loader, test_loader, scalers, components, energies = prepare_modwt_data(
+                fold_df,
+                vol_window=vol_window,
+                lookback=lookback,
+                forecast_horizon=forecast_horizon,
+                wavelet=wavelet,
+                level=level,
+                train_ratio=train_ratio,
+                batch_size=batch_size,
+                use_robust_scaler=use_robust_scaler
+            )
+
+            # 訓練模型
+            print(f"\n🚀 Training Fold {fold+1}...")
+            model, history, best_epoch = train_modwt_moe(
+                train_loader,
+                test_loader,
+                num_epochs=num_epochs,
+                lr=lr,
+                device=device
+            )
+
+            # 評估
+            print(f"\n📊 Evaluating Fold {fold+1}...")
+            test_metrics, test_preds, test_targets, test_expert_preds, test_gating_weights = evaluate(
+                model, test_loader, device
+            )
+
+            # Inverse transform
+            target_scaler = scalers['target']
+            volatility_mean = scalers['volatility_mean']
+
+            test_preds_centered = target_scaler.inverse_transform(test_preds.reshape(-1, 1)).flatten()
+            test_targets_centered = target_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
+
+            test_preds_original = test_preds_centered + volatility_mean
+            test_targets_original = test_targets_centered + volatility_mean
+
+            rmse_original = np.sqrt(mean_squared_error(test_targets_original, test_preds_original))
+            mae_original = mean_absolute_error(test_targets_original, test_preds_original)
+            r2_original = r2_score(test_targets_original, test_preds_original)
+
+            # 保存結果
+            fold_result = {
+                'fold': fold + 1,
+                'train_start': train_start,
+                'train_end': train_end,
+                'test_start': train_end,
+                'test_end': test_end,
+                'best_epoch': best_epoch,
+                'rmse': rmse_original,
+                'mae': mae_original,
+                'r2': r2_original,
+                'direction_acc': test_metrics['direction_acc'],
+                'expert1_weight': test_gating_weights[:, 0].mean(),
+                'expert2_weight': test_gating_weights[:, 1].mean(),
+                'expert3_weight': test_gating_weights[:, 2].mean(),
+            }
+
+            all_results.append(fold_result)
+
+            # 保存預測結果
+            all_predictions.append({
+                'fold': fold + 1,
+                'predictions': test_preds_original,
+                'targets': test_targets_original,
+                'gating_weights': test_gating_weights,
+                'expert_preds': test_expert_preds
+            })
+
+            # 可選: 保存模型
+            all_models.append({
+                'fold': fold + 1,
+                'model': model.state_dict(),
+                'scalers': scalers
+            })
+
+            # 打印這個 fold 的結果
+            print(f"\n✅ Fold {fold+1} Results:")
+            print(f"   RMSE: {rmse_original:.4f}%")
+            print(f"   MAE: {mae_original:.4f}%")
+            print(f"   R²: {r2_original:.6f}")
+            print(f"   Direction Accuracy: {test_metrics['direction_acc']*100:.2f}%")
+            print(f"   Gating Weights: E1={test_gating_weights[:, 0].mean():.3f}, "
+                  f"E2={test_gating_weights[:, 1].mean():.3f}, "
+                  f"E3={test_gating_weights[:, 2].mean():.3f}")
+
+        except Exception as e:
+            print(f"\n❌ Fold {fold+1} failed with error: {e}")
+            continue
+
+    # 匯總所有結果
+    results_df = pd.DataFrame(all_results)
+
+    print("\n" + "=" * 80)
+    print("📊 Walk-Forward Validation Summary")
+    print("=" * 80)
+    print(results_df.to_string(index=False))
+
+    print("\n📈 Statistical Summary:")
+    print(f"   RMSE:           {results_df['rmse'].mean():.4f}% ± {results_df['rmse'].std():.4f}%")
+    print(f"   MAE:            {results_df['mae'].mean():.4f}% ± {results_df['mae'].std():.4f}%")
+    print(f"   R²:             {results_df['r2'].mean():.4f} ± {results_df['r2'].std():.4f}")
+    print(f"   Direction Acc:  {results_df['direction_acc'].mean()*100:.2f}% ± {results_df['direction_acc'].std()*100:.2f}%")
+
+    print("\n📊 Gating Weights Across Folds:")
+    print(f"   Expert 1 (Trend):    {results_df['expert1_weight'].mean():.3f} ± {results_df['expert1_weight'].std():.3f}")
+    print(f"   Expert 2 (Cyclic):   {results_df['expert2_weight'].mean():.3f} ± {results_df['expert2_weight'].std():.3f}")
+    print(f"   Expert 3 (High-Freq): {results_df['expert3_weight'].mean():.3f} ± {results_df['expert3_weight'].std():.3f}")
+
+    return results_df, all_predictions, all_models
 
 # ==================== Visualization Functions ====================
 def plot_training_history(history, save_path='training_history.png'):
@@ -879,6 +1057,110 @@ def plot_gating_by_regime(gating_weights, targets_original, save_path='gating_dy
     print(f"📊 Saved: {save_path}")
     plt.close()
 
+def plot_wfv_results(results_df, save_path='../results/wfv_summary.png'):
+    """視覺化 Walk-Forward Validation 結果"""
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    folds = results_df['fold']
+
+    # RMSE 趨勢
+    axes[0, 0].plot(folds, results_df['rmse'], marker='o', linewidth=2, markersize=8)
+    axes[0, 0].axhline(results_df['rmse'].mean(), color='r', linestyle='--',
+                       label=f"Mean: {results_df['rmse'].mean():.4f}%")
+    axes[0, 0].set_xlabel('Fold', fontsize=12)
+    axes[0, 0].set_ylabel('RMSE (%)', fontsize=12)
+    axes[0, 0].set_title('RMSE Across Folds', fontsize=14, fontweight='bold')
+    axes[0, 0].legend()
+    axes[0, 0].grid(alpha=0.3)
+
+    # MAE 趨勢
+    axes[0, 1].plot(folds, results_df['mae'], marker='s', linewidth=2,
+                    markersize=8, color='orange')
+    axes[0, 1].axhline(results_df['mae'].mean(), color='r', linestyle='--',
+                       label=f"Mean: {results_df['mae'].mean():.4f}%")
+    axes[0, 1].set_xlabel('Fold', fontsize=12)
+    axes[0, 1].set_ylabel('MAE (%)', fontsize=12)
+    axes[0, 1].set_title('MAE Across Folds', fontsize=14, fontweight='bold')
+    axes[0, 1].legend()
+    axes[0, 1].grid(alpha=0.3)
+
+    # R² 趨勢
+    axes[0, 2].plot(folds, results_df['r2'], marker='^', linewidth=2,
+                    markersize=8, color='green')
+    axes[0, 2].axhline(results_df['r2'].mean(), color='r', linestyle='--',
+                       label=f"Mean: {results_df['r2'].mean():.4f}")
+    axes[0, 2].set_xlabel('Fold', fontsize=12)
+    axes[0, 2].set_ylabel('R²', fontsize=12)
+    axes[0, 2].set_title('R² Across Folds', fontsize=14, fontweight='bold')
+    axes[0, 2].legend()
+    axes[0, 2].grid(alpha=0.3)
+
+    # Direction Accuracy
+    axes[1, 0].plot(folds, results_df['direction_acc']*100, marker='d',
+                    linewidth=2, markersize=8, color='purple')
+    axes[1, 0].axhline(results_df['direction_acc'].mean()*100, color='r',
+                       linestyle='--', label=f"Mean: {results_df['direction_acc'].mean()*100:.2f}%")
+    axes[1, 0].set_xlabel('Fold', fontsize=12)
+    axes[1, 0].set_ylabel('Direction Accuracy (%)', fontsize=12)
+    axes[1, 0].set_title('Direction Accuracy Across Folds', fontsize=14, fontweight='bold')
+    axes[1, 0].legend()
+    axes[1, 0].grid(alpha=0.3)
+
+    # Gating Weights
+    axes[1, 1].plot(folds, results_df['expert1_weight'], marker='o',
+                    linewidth=2, label='Expert 1 (Trend)', color='green')
+    axes[1, 1].plot(folds, results_df['expert2_weight'], marker='s',
+                    linewidth=2, label='Expert 2 (Cyclic)', color='blue')
+    axes[1, 1].plot(folds, results_df['expert3_weight'], marker='^',
+                    linewidth=2, label='Expert 3 (High-Freq)', color='orange')
+    axes[1, 1].set_xlabel('Fold', fontsize=12)
+    axes[1, 1].set_ylabel('Average Gating Weight', fontsize=12)
+    axes[1, 1].set_title('Gating Weights Across Folds', fontsize=14, fontweight='bold')
+    axes[1, 1].legend()
+    axes[1, 1].grid(alpha=0.3)
+
+    # Box plot for RMSE
+    bp = axes[1, 2].boxplot([results_df['rmse']], labels=['RMSE'],
+                            patch_artist=True, widths=0.5)
+    bp['boxes'][0].set_facecolor('lightblue')
+    axes[1, 2].set_ylabel('RMSE (%)', fontsize=12)
+    axes[1, 2].set_title('RMSE Distribution', fontsize=14, fontweight='bold')
+    axes[1, 2].grid(alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Saved: {save_path}")
+    plt.close()
+
+
+def plot_wfv_predictions(all_predictions, save_path='../results/wfv_predictions.png'):
+    """視覺化所有 fold 的預測結果"""
+
+    fig, axes = plt.subplots(len(all_predictions), 1,
+                             figsize=(16, 4*len(all_predictions)))
+
+    if len(all_predictions) == 1:
+        axes = [axes]
+
+    for i, pred_data in enumerate(all_predictions):
+        fold = pred_data['fold']
+        preds = pred_data['predictions']
+        targets = pred_data['targets']
+
+        axes[i].plot(targets, label='Actual', color='blue', linewidth=1.5, alpha=0.7)
+        axes[i].plot(preds, label='Predicted', color='red', linewidth=1.5, alpha=0.7)
+        axes[i].set_xlabel('Time Step', fontsize=11)
+        axes[i].set_ylabel('Volatility (%)', fontsize=11)
+        axes[i].set_title(f'Fold {fold} Predictions', fontsize=13, fontweight='bold')
+        axes[i].legend()
+        axes[i].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Saved: {save_path}")
+    plt.close()
+
 
 # ==================== Main Execution ====================
 if __name__ == "__main__":
@@ -971,9 +1253,55 @@ if __name__ == "__main__":
     print(f"\n🏆 Best model from epoch {best_epoch}")
     print(f"   Final Test RMSE: {rmse_original:.4f}%")
     print(f"   Final Test MAE: {mae_original:.4f}%")
+    print(f"   Final R2: {r2_original:.4f}")
     print(f"   Final Test Direction Accuracy: {test_metrics['direction_acc']*100:.2f}%")
 
     # Summary of energy distribution
     print(f"\n📊 Component Energy Distribution (After Centering):")
     for name, energy in energies.items():
         print(f"   {name}: {energy:.2f}%")
+
+
+    # ==================== Walk-Forward Validation ====================
+    print("\n🔄 Starting Walk-Forward Validation...")
+
+    results_df, all_predictions, all_models = walk_forward_validation(
+        df,
+        vol_window=7,
+        lookback=30,
+        forecast_horizon=1,
+        wavelet='db4',
+        level=4,
+        train_window=4000,      # 每次用 4000 天訓練
+        test_window=500,        # 預測 500 天
+        step_size=500,          # 每次滾動 500 天
+        num_epochs=50,          # 每個 fold 訓練 50 epoch (節省時間)
+        batch_size=32,
+        lr=0.001,
+        use_robust_scaler=False,
+        device=DEVICE
+    )
+
+    # 保存結果
+    results_df.to_csv('../results/wfv_results.csv', index=False)
+    print(f"\n💾 Results saved to ../results/wfv_results.csv")
+
+    # 視覺化
+    plot_wfv_results(results_df, '../results/wfv_summary.png')
+    plot_wfv_predictions(all_predictions, '../results/wfv_predictions.png')
+
+    # 保存所有預測結果
+    for i, pred_data in enumerate(all_predictions):
+        fold = pred_data['fold']
+        pred_df = pd.DataFrame({
+            'Fold': fold,
+            'True_Volatility': pred_data['targets'],
+            'Predicted_Volatility': pred_data['predictions'],
+            'Expert1_Weight': pred_data['gating_weights'][:, 0],
+            'Expert2_Weight': pred_data['gating_weights'][:, 1],
+            'Expert3_Weight': pred_data['gating_weights'][:, 2],
+        })
+        pred_df.to_csv(f'../results/wfv_fold{fold}_predictions.csv', index=False)
+
+    print("\n✅ Walk-Forward Validation Complete!")
+    print(f"   Check ../results/ for all outputs")
