@@ -92,3 +92,5 @@ Thumbs.db
 *.gz
 *.rar
 *.7z
+
+drawio/

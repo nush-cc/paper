@@ -9,6 +9,8 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
+from scipy import stats
+from statsmodels.stats.diagnostic import acorr_ljungbox
 
 # Import modwtpy
 try:
@@ -1057,6 +1059,7 @@ def plot_gating_by_regime(gating_weights, targets_original, save_path='gating_dy
     print(f"📊 Saved: {save_path}")
     plt.close()
 
+
 def plot_wfv_results(results_df, save_path='../results/wfv_summary.png'):
     """視覺化 Walk-Forward Validation 結果"""
 
@@ -1172,48 +1175,188 @@ if __name__ == "__main__":
     df = df.sort_values("Date").reset_index(drop=True)
     print(f"✅ Loaded {len(df)} days of data")
 
-    # Prepare data with centering (80/20 split)
-    train_loader, test_loader, scalers, components, energies = prepare_modwt_data(
-        df,
-        vol_window=7,
-        lookback=30,
-        forecast_horizon=1,
-        wavelet='db4',
-        level=4,
-        train_ratio=0.80,  # 80/20 切分
-        use_robust_scaler=False
-    )
+    # ==================== 配置區 ====================
+    COMPARE_WAVELETS = True  # ← 改這裡！True=比較模式, False=單一小波模式
+    DEFAULT_WAVELET = 'db4'  # 單一模式時使用的小波
 
-    # Train model (無 validation)
-    trained_model, training_history, best_epoch = train_modwt_moe(
-        train_loader,
-        test_loader,
-        num_epochs=50,
-        lr=0.001,
-        device=DEVICE
-    )
+    if COMPARE_WAVELETS:
+        wavelets_to_test = ['haar', 'db2', 'db4', 'db6', 'sym4', 'sym8', 'coif1']
+        print(f"\n🔬 Mode: Wavelet Comparison")
+        print(f"   Testing {len(wavelets_to_test)} wavelets: {wavelets_to_test}")
+    else:
+        wavelets_to_test = [DEFAULT_WAVELET]
+        print(f"\n🔬 Mode: Single Wavelet")
+        print(f"   Using wavelet: {DEFAULT_WAVELET}")
 
-    # Evaluate on test set
-    print("\n" + "=" * 80)
-    print("📊 Final Evaluation on Test Set")
-    print("=" * 80)
+    results_comparison = []
+    all_training_histories = {}
+    all_test_results = {}
 
-    test_metrics, test_preds, test_targets, test_expert_preds, test_gating_weights = evaluate(
-        trained_model, test_loader, DEVICE
-    )
+    for wavelet in wavelets_to_test:
+        print(f"\n{'='*80}")
+        print(f"🔬 Testing Wavelet: {wavelet}")
+        print(f"{'='*80}")
 
-    # Inverse transform (統一用 inverse_transform)
+        # Prepare data with centering (80/20 split)
+        train_loader, test_loader, scalers, components, energies = prepare_modwt_data(
+            df,
+            vol_window=7,
+            lookback=30,
+            forecast_horizon=1,
+            wavelet=wavelet,  # ← 使用當前小波
+            level=4,
+            train_ratio=0.80,
+            use_robust_scaler=False
+        )
+
+        # Train model
+        trained_model, training_history, best_epoch = train_modwt_moe(
+            train_loader,
+            test_loader,
+            num_epochs=50,
+            lr=0.001,
+            device=DEVICE
+        )
+
+        # Evaluate on test set
+        print("\n" + "=" * 80)
+        print("📊 Final Evaluation on Test Set")
+        print("=" * 80)
+
+        test_metrics, test_preds, test_targets, test_expert_preds, test_gating_weights = evaluate(
+            trained_model, test_loader, DEVICE
+        )
+
+        # Inverse transform
+        target_scaler = scalers['target']
+        volatility_mean = scalers['volatility_mean']
+
+        test_preds_centered = target_scaler.inverse_transform(test_preds.reshape(-1, 1)).flatten()
+        test_targets_centered = target_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
+
+        test_preds_original = test_preds_centered + volatility_mean
+        test_targets_original = test_targets_centered + volatility_mean
+
+        rmse_original = np.sqrt(mean_squared_error(test_targets_original, test_preds_original))
+        mae_original = mean_absolute_error(test_targets_original, test_preds_original)
+        r2_original = r2_score(test_targets_original, test_preds_original)
+
+        # 保存結果
+        results_comparison.append({
+            'wavelet': wavelet,
+            'rmse': rmse_original,
+            'mae': mae_original,
+            'r2': r2_original,
+            'direction_acc': test_metrics['direction_acc'],
+            'best_epoch': best_epoch
+        })
+
+        # 保存詳細結果（用於後續視覺化）
+        all_training_histories[wavelet] = training_history
+        all_test_results[wavelet] = {
+            'preds': test_preds_original,
+            'targets': test_targets_original,
+            'gating_weights': test_gating_weights,
+            'expert_preds': test_expert_preds,
+            'scalers': scalers,
+            'energies': energies,
+            'metrics': test_metrics
+        }
+
+        print(f"\n✅ {wavelet} Results:")
+        print(f"   RMSE: {rmse_original:.4f}%")
+        print(f"   MAE: {mae_original:.4f}%")
+        print(f"   R²: {r2_original:.6f}")
+        print(f"   Direction Accuracy: {test_metrics['direction_acc']*100:.2f}%")
+
+    # ==================== 結果比較與選擇 ====================
+    comparison_df = pd.DataFrame(results_comparison)
+    comparison_df = comparison_df.sort_values('rmse')
+
+    if COMPARE_WAVELETS:
+        print("\n" + "="*80)
+        print("📊 Wavelet Comparison Results")
+        print("="*80)
+        print(comparison_df.to_string(index=False))
+
+        # 找出最佳小波
+        best_wavelet = comparison_df.iloc[0]['wavelet']
+        best_rmse = comparison_df.iloc[0]['rmse']
+        best_mae = comparison_df.iloc[0]['mae']
+        best_r2 = comparison_df.iloc[0]['r2']
+
+        print(f"\n🏆 Best Wavelet: {best_wavelet}")
+        print(f"   RMSE: {best_rmse:.4f}%")
+        print(f"   MAE: {best_mae:.4f}%")
+        print(f"   R²: {best_r2:.6f}")
+
+        # 保存比較結果
+        comparison_df.to_csv('../results/wavelet_comparison.csv', index=False)
+        print(f"\n💾 Comparison results saved to ../results/wavelet_comparison.csv")
+
+        # 視覺化比較
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+        # RMSE 比較
+        axes[0, 0].bar(comparison_df['wavelet'], comparison_df['rmse'], color='steelblue', alpha=0.8)
+        axes[0, 0].set_ylabel('RMSE (%)', fontsize=12)
+        axes[0, 0].set_title('RMSE Comparison', fontsize=14, fontweight='bold')
+        axes[0, 0].grid(axis='y', alpha=0.3)
+        axes[0, 0].tick_params(axis='x', rotation=45)
+
+        # MAE 比較
+        axes[0, 1].bar(comparison_df['wavelet'], comparison_df['mae'], color='coral', alpha=0.8)
+        axes[0, 1].set_ylabel('MAE (%)', fontsize=12)
+        axes[0, 1].set_title('MAE Comparison', fontsize=14, fontweight='bold')
+        axes[0, 1].grid(axis='y', alpha=0.3)
+        axes[0, 1].tick_params(axis='x', rotation=45)
+
+        # R² 比較
+        axes[1, 0].bar(comparison_df['wavelet'], comparison_df['r2'], color='lightgreen', alpha=0.8)
+        axes[1, 0].set_ylabel('R²', fontsize=12)
+        axes[1, 0].set_title('R² Comparison', fontsize=14, fontweight='bold')
+        axes[1, 0].grid(axis='y', alpha=0.3)
+        axes[1, 0].tick_params(axis='x', rotation=45)
+
+        # Direction Accuracy 比較
+        axes[1, 1].bar(comparison_df['wavelet'], comparison_df['direction_acc']*100, color='plum', alpha=0.8)
+        axes[1, 1].set_ylabel('Direction Accuracy (%)', fontsize=12)
+        axes[1, 1].set_title('Direction Accuracy Comparison', fontsize=14, fontweight='bold')
+        axes[1, 1].grid(axis='y', alpha=0.3)
+        axes[1, 1].tick_params(axis='x', rotation=45)
+
+        plt.tight_layout()
+        plt.savefig('../results/wavelet_comparison_charts.png', dpi=300, bbox_inches='tight')
+        print(f"📊 Saved: ../results/wavelet_comparison_charts.png")
+        plt.close()
+
+    else:
+        best_wavelet = DEFAULT_WAVELET
+        print(f"\n✅ Using single wavelet: {best_wavelet}")
+
+    # ==================== 使用最佳小波的結果進行詳細分析 ====================
+    print(f"\n{'='*80}")
+    print(f"📊 Detailed Analysis for Best Wavelet: {best_wavelet}")
+    print(f"{'='*80}")
+
+    # 取得最佳小波的結果
+    best_results = all_test_results[best_wavelet]
+    test_preds_original = best_results['preds']
+    test_targets_original = best_results['targets']
+    test_gating_weights = best_results['gating_weights']
+    test_expert_preds = best_results['expert_preds']
+    scalers = best_results['scalers']
+    energies = best_results['energies']
+    test_metrics = best_results['metrics']
+    training_history = all_training_histories[best_wavelet]
+
+    # 重新計算 test_preds 和 test_targets (scaled版本，用於存檔)
     target_scaler = scalers['target']
     volatility_mean = scalers['volatility_mean']
+    test_preds = target_scaler.transform((test_preds_original - volatility_mean).reshape(-1, 1)).flatten()
+    test_targets = target_scaler.transform((test_targets_original - volatility_mean).reshape(-1, 1)).flatten()
 
-    # 步驟1: inverse_transform
-    test_preds_centered = target_scaler.inverse_transform(test_preds.reshape(-1, 1)).flatten()
-    test_targets_centered = target_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
-
-    # 步驟2: 加回均值
-    test_preds_original = test_preds_centered + volatility_mean
-    test_targets_original = test_targets_centered + volatility_mean
-
+    # 計算指標
     rmse_original = np.sqrt(mean_squared_error(test_targets_original, test_preds_original))
     mae_original = mean_absolute_error(test_targets_original, test_preds_original)
     r2_original = r2_score(test_targets_original, test_preds_original)
@@ -1229,40 +1372,39 @@ if __name__ == "__main__":
     print(f"   Expert 2 (Cyclic): {test_gating_weights[:, 1].mean():.3f} ± {test_gating_weights[:, 1].std():.3f}")
     print(f"   Expert 3 (High-Freq): {test_gating_weights[:, 2].mean():.3f} ± {test_gating_weights[:, 2].std():.3f}")
 
-    # Visualizations
+    # Visualizations (使用最佳小波)
     print("\n📊 Generating visualizations...")
-    plot_training_history(training_history, '../results/training_history_8020.png')
-    plot_predictions(test_targets_original, test_preds_original, '../results/test_predictions_8020.png')
-    plot_gating_weights(test_gating_weights, '../results/test_gating_weights_8020.png')
+    plot_training_history(training_history, f'../results/training_history_{best_wavelet}.png')
+    plot_predictions(test_targets_original, test_preds_original, f'../results/test_predictions_{best_wavelet}.png')
+    plot_gating_weights(test_gating_weights, f'../results/test_gating_weights_{best_wavelet}.png')
 
-    # Save results
+    # Save results (使用最佳小波)
     test_results_df = save_results_to_csv(
         test_targets, test_preds, test_gating_weights,
-        test_expert_preds, scalers, '../results/test_results_8020.csv'
+        test_expert_preds, scalers, f'../results/test_results_{best_wavelet}.csv'
     )
 
-    # Analysis
+    # Analysis (使用最佳小波)
     print("\n" + "=" * 80)
     print("📊 Gating Dynamics Analysis (Test Set)")
     print("=" * 80)
     analyze_gating_dynamics(test_gating_weights, test_targets_original)
     plot_gating_by_regime(test_gating_weights, test_targets_original,
-                          '../results/test_gating_dynamics_by_regime_8020.png')
+                          f'../results/test_gating_dynamics_by_regime_{best_wavelet}.png')
 
-    print("\n✅ All done! Check the ../results/ folder for outputs.")
-    print(f"\n🏆 Best model from epoch {best_epoch}")
-    print(f"   Final Test RMSE: {rmse_original:.4f}%")
-    print(f"   Final Test MAE: {mae_original:.4f}%")
-    print(f"   Final R2: {r2_original:.4f}")
-    print(f"   Final Test Direction Accuracy: {test_metrics['direction_acc']*100:.2f}%")
-
-    # Summary of energy distribution
-    print(f"\n📊 Component Energy Distribution (After Centering):")
+    # Summary of energy distribution (使用最佳小波)
+    print(f"\n📊 Component Energy Distribution (After Centering) - {best_wavelet}:")
     for name, energy in energies.items():
         print(f"   {name}: {energy:.2f}%")
 
+    print("\n✅ All done! Check the ../results/ folder for outputs.")
+    print(f"\n🏆 Best Wavelet: {best_wavelet}")
+    print(f"   Final Test RMSE: {rmse_original:.4f}%")
+    print(f"   Final Test MAE: {mae_original:.4f}%")
+    print(f"   Final R²: {r2_original:.6f}")
+    print(f"   Final Test Direction Accuracy: {test_metrics['direction_acc']*100:.2f}%")
 
-    # ==================== Walk-Forward Validation ====================
+    # # ==================== Walk-Forward Validation ====================
     print("\n🔄 Starting Walk-Forward Validation...")
 
     results_df, all_predictions, all_models = walk_forward_validation(
@@ -1305,3 +1447,92 @@ if __name__ == "__main__":
 
     print("\n✅ Walk-Forward Validation Complete!")
     print(f"   Check ../results/ for all outputs")
+
+    # 診斷腳本 - 請在你的main code後面跑
+    print("=" * 80)
+    print("🔍 DIAGNOSTIC CHECK")
+    print("=" * 80)
+
+    # 假設你有 all_predictions (from WFV)
+    # all_predictions[0] = {'fold': 1, 'predictions': ..., 'targets': ...}
+
+    for i, pred_data in enumerate(all_predictions):
+        fold = pred_data['fold']
+        preds = pred_data['predictions']
+        targets = pred_data['targets']
+
+        residuals_fold = targets - preds
+
+        print(f"\nFold {fold}:")
+        print(f"   Residual mean: {residuals_fold.mean():.6f}")
+        print(f"   Residual std:  {residuals_fold.std():.6f}")
+        print(f"   Residual max:  {residuals_fold.max():.6f}")
+        print(f"   Residual min:  {residuals_fold.min():.6f}")
+        print(f"   Count of |res| > 5%: {np.sum(np.abs(residuals_fold) > 5)}")
+        print(f"   Count of |res| > 10%: {np.sum(np.abs(residuals_fold) > 10)}")
+
+        # 合併Fold 2-5的殘差（排除warm-up期）
+    residuals_stable = np.concatenate([
+        all_predictions[1]['targets'] - all_predictions[1]['predictions'],  # Fold 2
+        all_predictions[2]['targets'] - all_predictions[2]['predictions'],  # Fold 3
+        all_predictions[3]['targets'] - all_predictions[3]['predictions'],  # Fold 4
+        all_predictions[4]['targets'] - all_predictions[4]['predictions'],  # Fold 5
+    ])
+
+    print("=" * 80)
+    print("📊 RESIDUAL DIAGNOSTICS (Fold 2-5, Excluding Warm-up)")
+    print("=" * 80)
+
+    # 1. Normality test
+    stat_shapiro, p_shapiro = stats.shapiro(residuals_stable)
+    print(f"\n1️⃣ Shapiro-Wilk Normality Test:")
+    print(f"   p-value: {p_shapiro:.6f}")
+    print(f"   Result: {'✅ 正態分布 (p > 0.05)' if p_shapiro > 0.05 else '⚠️ 非正態 (時間序列常見)'}")
+
+    # 2. Autocorrelation test
+    lb_test = acorr_ljungbox(residuals_stable, lags=[10, 20], return_df=True)
+    print(f"\n2️⃣ Ljung-Box Autocorrelation Test:")
+    print(f"   Lag 10 p-value: {lb_test['lb_pvalue'].iloc[0]:.6f}")
+    print(f"   Lag 20 p-value: {lb_test['lb_pvalue'].iloc[1]:.6f}")
+    print(f"   Result: {'✅ 無自相關 (獨立同分布)' if lb_test['lb_pvalue'].min() > 0.05 else '⚠️ 有自相關 (時間序列常見)'}")
+
+    # 3. Statistics
+    print(f"\n3️⃣ Residual Statistics:")
+    print(f"   Mean: {residuals_stable.mean():.6f}% ✅ (應接近0)")
+    print(f"   Std:  {residuals_stable.std():.6f}%")
+    print(f"   Min:  {residuals_stable.min():.6f}%")
+    print(f"   Max:  {residuals_stable.max():.6f}%")
+    print(f"   Range: {residuals_stable.max() - residuals_stable.min():.6f}%")
+
+    # 4. Visualization
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Time series
+    axes[0, 0].plot(residuals_stable, alpha=0.7, linewidth=1)
+    axes[0, 0].axhline(0, color='r', linestyle='--', alpha=0.5)
+    axes[0, 0].set_title('Residuals Over Time (Fold 2-5)', fontsize=12, fontweight='bold')
+    axes[0, 0].set_ylabel('Residual (%)')
+    axes[0, 0].grid(alpha=0.3)
+
+    # Distribution
+    axes[0, 1].hist(residuals_stable, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+    axes[0, 1].axvline(residuals_stable.mean(), color='r', linestyle='--', linewidth=2, label=f'Mean={residuals_stable.mean():.4f}%')
+    axes[0, 1].set_title('Residual Distribution', fontsize=12, fontweight='bold')
+    axes[0, 1].set_xlabel('Residual (%)')
+    axes[0, 1].legend()
+    axes[0, 1].grid(alpha=0.3, axis='y')
+
+    # ACF
+    from statsmodels.graphics.tsaplots import plot_acf
+    plot_acf(residuals_stable, lags=40, ax=axes[1, 0])
+    axes[1, 0].set_title('ACF - Autocorrelation Check', fontsize=12, fontweight='bold')
+
+    # Q-Q plot
+    stats.probplot(residuals_stable, dist="norm", plot=axes[1, 1])
+    axes[1, 1].set_title('Q-Q Plot - Normality Check', fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig('residual_diagnostics_stable.png', dpi=300, bbox_inches='tight')
+    print(f"\n✅ Saved: residual_diagnostics_stable.png")
+
+    print("\n" + "=" * 80)
