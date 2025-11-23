@@ -17,7 +17,7 @@ warnings.filterwarnings('ignore')
 
 # ==================== Configuration ====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = 42
+SEED = 6680
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
@@ -611,10 +611,10 @@ if __name__ == "__main__":
     moe_results = {
         'model': None,
         'metrics': {
-            'rmse': 2.3215,
-            'mae': 0.7673,
-            'r2': 0.6074,
-            'direction_acc': 0.5584
+            'rmse': 2.0198,
+            'mae': 0.6863,
+            'r2': 0.6781,
+            'direction_acc': 0.5627
         },
         'predictions': None,
         'targets': None
