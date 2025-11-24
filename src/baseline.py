@@ -17,7 +17,8 @@ warnings.filterwarnings('ignore')
 
 # ==================== Configuration ====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = 6680
+# SEED = 6680
+SEED = np.random.randint(1, 10000)
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
@@ -415,7 +416,7 @@ def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.80):
     gru_model = SingleGRU(input_size=1, hidden_size=64, num_layers=2, dropout=0.2)
     gru_model, metrics_scaled, preds_scaled, targets_scaled = train_neural_baseline(
         gru_model, train_loader, test_loader, "Single GRU",
-        num_epochs=50
+        num_epochs=100
     )
 
     # Inverse transform (與 MoE 相同)
@@ -455,7 +456,7 @@ def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.80):
     lstm_model = SingleLSTM(input_size=1, hidden_size=64, num_layers=2, dropout=0.2)
     lstm_model, metrics_scaled, preds_scaled, targets_scaled = train_neural_baseline(
         lstm_model, train_loader, test_loader, "Single LSTM",
-        num_epochs=50
+        num_epochs=100
     )
 
     # Inverse transform
@@ -611,10 +612,10 @@ if __name__ == "__main__":
     moe_results = {
         'model': None,
         'metrics': {
-            'rmse': 2.0198,
-            'mae': 0.6863,
-            'r2': 0.6781,
-            'direction_acc': 0.5627
+            'rmse': 1.4197,
+            'mae': 1.0303,
+            'r2': 0.8409,
+            'direction_acc': 0.6672
         },
         'predictions': None,
         'targets': None
