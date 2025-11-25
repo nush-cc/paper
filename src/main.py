@@ -160,36 +160,47 @@ class AttentionExpert(nn.Module):
         )
 
     def forward(self, x):
-        """
-        Args:
-            x: [batch_size, seq_len, input_size]
+            """
+            修正後的 Attention：讓最後一個時間點 (Query) 去關注過去所有時間點 (Keys)
+            """
+            # gru_out: [batch, seq_len, hidden_size] -> 這是 Keys
+            # h_n:     [num_layers, batch, hidden_size] -> 這是最後的狀態
+            gru_out, h_n = self.gru(x)
+            
+            # 1. 定義 Query (取最後一層的最後一個時間點狀態)
+            # h_n[-1] 形狀是 [batch, hidden_size]
+            # 我們需要把它擴充成 [batch, seq_len, hidden_size] 以便跟序列做運算，或者直接用廣播
+            query_vector = h_n[-1] 
 
-        Returns:
-            prediction: [batch_size, 1]
-            attention_weights: [batch_size, seq_len]
-        """
-        # GRU forward pass (returns: output, h_n where h_n is the final hidden state)
-        gru_out, h_n = self.gru(x)  # gru_out: [batch, seq_len, hidden_size], h_n: [num_layers, batch, hidden_size]
+            # 2. 計算 Attention Score (Bahdanau Style)
+            # Score = V * tanh(Wq * Query + Wk * Keys)
+            
+            # [batch, 1, attn_size]
+            query_proj = self.attention_query(query_vector).unsqueeze(1) 
+            
+            # [batch, seq_len, attn_size]
+            key_proj = self.attention_key(gru_out) 
+            
+            # 兩者相加 (PyTorch 會自動廣播 Query 到每一個 Time Step)
+            # 意義：比較 "今天狀態" 與 "過去每一天狀態"
+            attention_logits = torch.tanh(query_proj + key_proj)
+            
+            # [batch, seq_len, 1]
+            attention_logits = self.attention_score(attention_logits)
 
-        # Temporal Attention
-        query = self.attention_query(gru_out)
-        key = self.attention_key(gru_out)
-        attention_logits = torch.tanh(query + key)
-        attention_logits = self.attention_score(attention_logits)
+            # 3. Softmax (歸一化)
+            attention_weights = torch.softmax(attention_logits.squeeze(-1), dim=1)
 
-        # Softmax attention weights
-        attention_weights = torch.softmax(attention_logits.squeeze(-1), dim=1)
+            # 4. 加權總和
+            context_vector = torch.sum(
+                gru_out * attention_weights.unsqueeze(-1),
+                dim=1
+            )
 
-        # Apply attention
-        context_vector = torch.sum(
-            gru_out * attention_weights.unsqueeze(-1),
-            dim=1
-        )
+            context_vector = self.dropout(context_vector)
+            prediction = self.fc(context_vector)
 
-        context_vector = self.dropout(context_vector)
-        prediction = self.fc(context_vector)
-
-        return prediction, attention_weights
+            return prediction, attention_weights
 
 
 class TrendExpert(AttentionExpert):
@@ -398,7 +409,7 @@ class AdvancedResidualMODWTMoE(nn.Module):
 def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
                        wavelet='db4', level=4,
                        train_ratio=0.80, batch_size=32,
-                       use_robust_scaler=False, buffer_size=200):
+                       use_robust_scaler=False, buffer_size=200, run_mode="NORMAL"):
     """Prepare MODWT data WITH RSI & RETURNS Features"""
 
     print("[Data Preparation] MODWT + RSI + Returns (Feature Enhanced)")
@@ -519,6 +530,45 @@ def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
     train_targets = train_vol_scaled[lookback + 1:lookback + 1 + len(train_e1)].reshape(-1, 1)
     test_targets = test_vol_scaled[lookback + 1:lookback + 1 + len(test_e1)].reshape(-1, 1)
 
+    # =========================================================
+    # [SANITY CHECK MODE]
+    # 這裡才是正確的打亂方式：保留 X 的結構，但隨機打亂 y。
+    # 如果模型還能預測準，那就是見鬼了。
+    # =========================================================
+    DO_SANITY_CHECK = (run_mode == "SANITY_TARGET_SHUFFLE")
+
+    if DO_SANITY_CHECK:
+        print("\nWARNING: SANITY CHECK ENABLED - SHUFFLING TARGETS ONLY")
+        np.random.shuffle(train_targets)
+        np.random.shuffle(test_targets)
+        print("  Targets have been shuffled independently of features.")
+    # =========================================================
+
+    # [SANITY CHECK MODE 2: INPUT DESTRUCTION]
+    DO_INPUT_SHUFFLE = (run_mode == "SANITY_INPUT_SHUFFLE")
+
+    if DO_INPUT_SHUFFLE:
+        print("\nWARNING: INPUT SHUFFLE CHECK - DESTROYING FEATURES")
+        
+        # 方法 A: 隨機打亂 (保留分佈，破壞順序) -> 測試是否依賴時間結構
+        # 注意：要對 train_e1, e2, e3 和 raw 全部打亂
+        idx = np.random.permutation(len(train_e1))
+        train_e1 = train_e1[idx]
+        train_e2 = train_e2[idx]
+        train_e3 = train_e3[idx]
+        train_raw = train_raw[idx]
+        
+        idx_test = np.random.permutation(len(test_e1))
+        test_e1 = test_e1[idx_test]
+        test_e2 = test_e2[idx_test]
+        test_e3 = test_e3[idx_test]
+        test_raw = test_raw[idx_test]
+        
+        # Target 保持原樣！不動！
+        # train_targets = train_targets 
+        
+        print("  Features have been destroyed. Targets remain real.")
+
     # Datasets
     train_dataset = MODWTVolatilityDataset(train_e1, train_e2, train_e3, train_targets, raw_input=train_raw)
     test_dataset = MODWTVolatilityDataset(test_e1, test_e2, test_e3, test_targets, raw_input=test_raw)
@@ -531,7 +581,13 @@ def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
     # Calculate energies (dummy for return signature)
     energies = {}
 
-    return train_loader, test_loader, scalers, train_mean, energies
+    run_mode = run_mode
+    if DO_SANITY_CHECK:
+        run_mode = "SANITY_TARGET_SHUFFLE"
+    elif DO_INPUT_SHUFFLE:
+        run_mode = "SANITY_INPUT_SHUFFLE"
+
+    return train_loader, test_loader, scalers, train_mean, energies, run_mode
 
 
 # ==================== Two-Stage Curriculum Training ====================
@@ -897,13 +953,6 @@ def evaluate(model, data_loader, device):
         'naive_direction_acc': naive_direction_acc # [新增]
     }
 
-    # Print Comparison Report
-    print("-" * 50)
-    print(f"Model vs Naive Baseline Comparison:")
-    print(f"RMSE:     {rmse:.4f} vs {naive_rmse:.4f} (Naive)")
-    print(f"MAE:      {mae:.4f} vs {naive_mae:.4f} (Naive)")
-    print(f"Dir Acc:  {direction_acc:.4f} vs {naive_direction_acc:.4f} (Lag Test)")
-
     return (metrics, predictions, targets, base_predictions, moe_deltas,
             expert_preds_all, gating_weights, attention_weights_concat, alphas)
 # ==================== Visualization ====================
@@ -1250,20 +1299,22 @@ def plot_attention_maps(attention_weights, save_path='attention_maps.png'):
 if __name__ == "__main__":
     os.makedirs('../results', exist_ok=True)
 
+    RUN_MODE = "SANITY_TARGET_SHUFFLE"  # 可選：NORMAL, SANITY_INPUT_SHUFFLE, SANITY_TARGET_SHUFFLE
+
     print("\n" + "="*80)
     print("[MODWT-MoE Volatility Forecasting - Production Model]")
     print("="*80)
 
-    # Load data
+    # 1. Load data
     print("\n[Loading Data]")
     df = pd.read_csv("../dataset/USD_TWD.csv")
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     print(f"  Loaded {len(df)} days")
 
-    # Prepare data
+    # 2. Prepare data
     print("\n[Data Preparation]")
-    train_loader, test_loader, scalers, volatility_mean, energies = prepare_modwt_data(
+    train_loader, test_loader, scalers, volatility_mean, energies, run_mode = prepare_modwt_data(
         df,
         vol_window=7,
         lookback=30,
@@ -1273,10 +1324,11 @@ if __name__ == "__main__":
         train_ratio=0.80,
         batch_size=32,
         use_robust_scaler=False,
-        buffer_size=200
+        buffer_size=200,
+        run_mode=RUN_MODE
     )
 
-    # Train
+    # 3. Train
     print("\n[Training]")
     trained_model, training_history, best_epoch = train_hybrid_moe_curriculum(
         train_loader,
@@ -1287,106 +1339,99 @@ if __name__ == "__main__":
     )
 
     # =========================================================================
-    # [Evaluation & Metrics Calculation]
+    # [Evaluation & Smart Reporting Logic]
     # =========================================================================
 
-    # 1. Unpack all 9 return values from the updated evaluate function
+    # 4. Get Raw Predictions
     (test_metrics, test_preds, test_targets, test_base_preds, test_moe_deltas,
      test_expert_preds, test_gating_weights, test_attention_weights, test_alphas) = evaluate(
         trained_model, test_loader, DEVICE
     )
 
-    # 2. Inverse Transform Logic
-    # -------------------------------------------------------------------------
+    # 5. Inverse Transform (還原回真實波動率數值)
     target_scaler = scalers['target']
-
-    # A. 標準還原 (針對絕對數值：Predictions, Targets, Base Predictions)
-    # 這些值是經過 (x - mean) / std 處理過的
-    # inverse_transform 會做: x * std + mean (還原回 Centered Data)
+    
     test_preds_centered = target_scaler.inverse_transform(test_preds.reshape(-1, 1)).flatten()
     test_targets_centered = target_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
     test_base_preds_centered = target_scaler.inverse_transform(test_base_preds.reshape(-1, 1)).flatten()
 
-    # B. 增量還原 (針對 MoE Delta)
-    # MoE Delta 是一個 "變化量"，不包含平均值基線
-    # 所以我們只乘上標準差 (Scale)，不能加回 Mean
-    # scaler.scale_ 儲存的是標準差 (std)
-    std_dev = np.sqrt(target_scaler.var_[0]) # 或者直接用 scaler.scale_[0]
+    std_dev = np.sqrt(target_scaler.var_[0])
     test_moe_deltas_original = test_moe_deltas * std_dev
 
-    # C. 加回全域平均值 (回到原始波動率百分比)
     test_preds_original = test_preds_centered + volatility_mean
     test_targets_original = test_targets_centered + volatility_mean
     test_base_preds_original = test_base_preds_centered + volatility_mean
 
-    # -------------------------------------------------------------------------
-    # [Optional: Log-Space Handling]
-    # 如果你有使用 np.log1p 預處理，請解開以下註解：
-    # test_preds_original = np.expm1(test_preds_original)
-    # test_targets_original = np.expm1(test_targets_original)
-    # test_base_preds_original = np.expm1(test_base_preds_original)
-    # -------------------------------------------------------------------------
-
-    # 3. Calculate Final Metrics (On Original Scale)
-    # -------------------------------------------------------------------------
-    # Hybrid Model (Final Output)
+    # 6. Calculate Real-World Metrics
+    # R2 & RMSE
+    r2_original = r2_score(test_targets_original, test_preds_original)
     rmse_original = np.sqrt(mean_squared_error(test_targets_original, test_preds_original))
     mae_original = mean_absolute_error(test_targets_original, test_preds_original)
-    r2_original = r2_score(test_targets_original, test_preds_original)
-
-    # LSTM Base Only (Anchor)
+    
+    # LSTM Base Metrics
     rmse_base = np.sqrt(mean_squared_error(test_targets_original, test_base_preds_original))
-    mae_base = mean_absolute_error(test_targets_original, test_base_preds_original)
-    r2_base = r2_score(test_targets_original, test_base_preds_original)
 
-    # Direction Accuracy (Already calculated in evaluate, but confirm on original scale)
+    # True Direction Accuracy (基於還原後的真實走勢)
+    # 這是最公正的指標，不受 Shuffle 影響定義
     dir_true = np.sign(np.diff(test_targets_original))
     dir_pred = np.sign(np.diff(test_preds_original))
-    direction_acc = np.mean(dir_true == dir_pred)
+    true_direction_acc = np.mean(dir_true == dir_pred)
 
-    # 4. Print Comprehensive Report
-    # -------------------------------------------------------------------------
-    print(f"\n" + "="*80)
-    print(f"[Test Set Performance - Advanced Residual MODWT-MoE]")
-    print(f"="*80)
+    # =========================================================================
+    # [CONDITIONAL PRINTING] 根據模式決定顯示什麼報告
+    # =========================================================================
+    print("\n" + "="*80)
+    
+    if run_mode == "SANITY_INPUT_SHUFFLE":
+        print(f"SANITY CHECK REPORT: INPUT DESTRUCTION MODE (X-Shuffle)")
+        print("="*80)
+        print("   TEST GOAL: Verify model fails when input features are destroyed.")
+        print("   (We want to prove the model isn't just memorizing the output trend.)")
+        print("-" * 60)
+        
+        # 判斷 R2 (應該要是負的)
+        print(f"   1. R² Score:            {r2_original:.4f}  ", end="")
 
-    print(f"\n1. Overall Performance (Hybrid):")
-    print(f"   RMSE:               {rmse_original:.4f}%")
-    print(f"   MAE:                {mae_original:.4f}%")
-    print(f"   R²:                 {r2_original:.4f}")
-    print(f"   Direction Accuracy: {direction_acc*100:.2f}%")
+        # 判斷 Direction (應該要在 50% 附近)
+        print(f"   2. Direction Accuracy:  {true_direction_acc*100:.2f}%   ", end="")
+        
+        print("-" * 60)
+        print("   NOTE: Ignore internal metrics inside evaluate().")
+        print("   The metrics above are calculated against the REAL target trend.")
 
-    print(f"\n2. Ablation Analysis (Contribution of Components):")
-    print(f"   LSTM Base (RMSE):   {rmse_base:.4f}%")
-    print(f"   Hybrid Improv.:     {(rmse_base - rmse_original):.4f}% ({(rmse_base - rmse_original)/rmse_base*100:.2f}% reduction in error)")
-    print(f"   (If improvement is positive, the Experts + Meta-Gate are working)")
+    elif run_mode == "SANITY_TARGET_SHUFFLE":
+        print(f"SANITY CHECK REPORT: TARGET SHUFFLE MODE (Y-Shuffle)")
+        print("="*80)
+        print("   TEST GOAL: Verify model fails when answers are randomized.")
+        print("   (We want to prove there is no label leakage.)")
+        print("-" * 60)
+        
+        print(f"   R² Score: {r2_original:.4f} \n", end="")
 
-    print(f"\n3. Dynamic Meta-Gate Statistics (Alpha):")
-    print(f"   Mean Alpha:         {test_alphas.mean():.4f} (Avg reliance on Experts)")
-    print(f"   Std Alpha:          {test_alphas.std():.4f} (How much it adapts)")
-    print(f"   Max Alpha:          {test_alphas.max():.4f}")
-    print(f"   Min Alpha:          {test_alphas.min():.4f}")
+    else:
+        # NORMAL MODE (正常訓練時才顯示這份詳細報告)
+        print(f"[PRODUCTION RESULTS] Advanced Residual MODWT-MoE")
+        print("="*80)
 
-    print(f"   Interpretation:")
-    print(f"   - High Alpha (>0.5): Model relied heavily on GRU Experts (likely high volatility).")
-    print(f"   - Low Alpha (<0.2):  Model trusted LSTM Base more (likely stable trend).")
-    print(f"="*80 + "\n")
+        print(f"\n1. Overall Performance (Hybrid):")
+        print(f"   RMSE:               {rmse_original:.4f}%")
+        print(f"   MAE:                {mae_original:.4f}%")
+        print(f"   R²:                 {r2_original:.4f}")
+        print(f"   Direction Accuracy: {true_direction_acc*100:.2f}%")
 
-    # Visualizations
-    print("\n[Visualizations]")
-    plot_training_curves(training_history, '../results/training_history.png')
-    plot_predictions(test_targets_original, test_preds_original, test_base_preds_original,
-                     '../results/predictions.png')
-    plot_gating_weights(test_gating_weights, test_targets_original, save_path='../results/gating_weights.png')
+        print(f"\n2. Ablation Analysis (Contribution):")
+        print(f"   LSTM Base RMSE:     {rmse_base:.4f}%")
+        print(f"   Hybrid Improv.:     {(rmse_base - rmse_original):.4f}%")
 
-    plot_attention_maps(test_attention_weights, save_path='../results/attention_maps.png')
+        print(f"\n3. Meta-Gate Statistics:")
+        print(f"   Mean Alpha:         {test_alphas.mean():.4f}")
+        print(f"   (High Alpha = Experts Active, Low Alpha = Base Active)")
+        
+        # 只有在正常模式下才畫圖
+        print("\n[Visualizations]")
+        plot_training_curves(training_history, '../results/training_history.png')
+        plot_predictions(test_targets_original, test_preds_original, test_base_preds_original, '../results/predictions.png')
+        plot_gating_weights(test_gating_weights, test_targets_original, save_path='../results/gating_weights.png')
+        plot_attention_maps(test_attention_weights, save_path='../results/attention_maps.png')
 
-    # Summary
-    print(f"\n[Summary]")
-    print(f"  Best epoch: {best_epoch}")
-    print(f"  Test RMSE: {rmse_original:.4f}%")
-    print(f"  Test MAE: {mae_original:.4f}%")
-    print(f"  Test R²: {r2_original:.4f}")
-    print(f"  Direction Accuracy: {test_metrics['direction_acc']*100:.2f}%")
-    print(f"\n  Results saved to ../results/")
     print("="*80 + "\n")
