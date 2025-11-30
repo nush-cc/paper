@@ -43,8 +43,8 @@ except ImportError:
 
 # ==================== Configuration ====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# SEED = np.random.randint(1, 10000)
-SEED = 5592
+SEED = np.random.randint(1, 10000)
+# SEED = 5592
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -1294,12 +1294,51 @@ def plot_attention_maps(attention_weights, save_path='attention_maps.png'):
     
     print(f"✓ Attention maps saved to {save_path}")
 
+def plot_alpha_distribution(alphas, save_path='../results/alpha_dist.png'):
+    """
+    繪製 Meta-Gate Alpha 值的直方圖分佈
+    用來觀察模型是傾向於依賴 Expert (Alpha -> 1) 還是 Base (Alpha -> 0)
+    或者是動態調整 (分佈廣)
+    """
+    # 確保 alphas 是 numpy array
+    if isinstance(alphas, torch.Tensor):
+        alphas = alphas.cpu().detach().numpy()
+        
+    plt.figure(figsize=(10, 6))
+    
+    # 繪製直方圖
+    n, bins, patches = plt.hist(alphas, bins=50, color='#9467bd', alpha=0.7, 
+                                edgecolor='black', linewidth=0.8, label='Alpha Frequency')
+    
+    # 繪製平均線
+    mean_val = alphas.mean()
+    plt.axvline(mean_val, color='#d62728', linestyle='--', linewidth=2, 
+                label=f'Mean: {mean_val:.4f}')
+    
+    # 裝飾圖表
+    plt.title('Distribution of Meta-Gate Alpha Values\n(0 = LSTM Base Only, 1 = Full Expert Residual)', 
+              fontsize=14, fontweight='bold')
+    plt.xlabel('Alpha Value', fontsize=12)
+    plt.ylabel('Frequency (Number of Samples)', fontsize=12)
+    plt.legend(loc='upper right', frameon=True, fontsize=11)
+    plt.grid(alpha=0.3, linestyle='--')
+    plt.xlim(0, 1) # Alpha 範圍被 Sigmoid 限制在 0-1 之間
+    
+    # 加入文字註解
+    plt.text(0.02, plt.ylim()[1]*0.95, 'Mostly Base ←', fontsize=10, color='gray', ha='left')
+    plt.text(0.98, plt.ylim()[1]*0.95, '→ Mostly Expert', fontsize=10, color='gray', ha='right')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✓ Alpha distribution plot saved to {save_path}")
 
 # ==================== Main ====================
 if __name__ == "__main__":
     os.makedirs('../results', exist_ok=True)
 
-    RUN_MODE = "SANITY_TARGET_SHUFFLE"  # 可選：NORMAL, SANITY_INPUT_SHUFFLE, SANITY_TARGET_SHUFFLE
+    RUN_MODE = "NORMAL"  # 可選：NORMAL, SANITY_INPUT_SHUFFLE, SANITY_TARGET_SHUFFLE
 
     print("\n" + "="*80)
     print("[MODWT-MoE Volatility Forecasting - Production Model]")
@@ -1393,7 +1432,7 @@ if __name__ == "__main__":
         print(f"   1. R² Score:            {r2_original:.4f}  ", end="")
 
         # 判斷 Direction (應該要在 50% 附近)
-        print(f"   2. Direction Accuracy:  {true_direction_acc*100:.2f}%   ", end="")
+        print(f"   2. Direction Accuracy:  {true_direction_acc*100:.2f}%   \n", end="")
         
         print("-" * 60)
         print("   NOTE: Ignore internal metrics inside evaluate().")
@@ -1433,5 +1472,6 @@ if __name__ == "__main__":
         plot_predictions(test_targets_original, test_preds_original, test_base_preds_original, '../results/predictions.png')
         plot_gating_weights(test_gating_weights, test_targets_original, save_path='../results/gating_weights.png')
         plot_attention_maps(test_attention_weights, save_path='../results/attention_maps.png')
+        plot_alpha_distribution(test_alphas, save_path='../results/alpha_dist.png')
 
     print("="*80 + "\n")
