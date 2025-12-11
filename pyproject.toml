@@ -1,0 +1,26 @@
+[project]
+name = "paper4"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11, <3.12"
+dependencies = [
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.5",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchvision==0.22.1",
+    "tqdm>=4.67.1",
+]
+
+[[tool.uv.index]]
+name = "pytorch_cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch_cu118" }]
+torchvision = [{ index = "pytorch_cu118" }]
+torchaudio = [{ index = "pytorch_cu118" }]

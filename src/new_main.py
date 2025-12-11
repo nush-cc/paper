@@ -34,7 +34,8 @@ if not dataset_path.exists():
 
 # ==================== Configuration ====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = random.randint(0, 10000)  # Fixed seed for reproducibility
+# SEED = random.randint(0, 10000)  # Fixed seed for reproducibility
+SEED = 5827
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -125,6 +126,41 @@ class AttentionExpert(nn.Module):
         context = self.dropout(context)
         return self.fc(context), attn_weights
 
+class SimpleGRUExpert(nn.Module):
+    """
+    沒有 Attention 的單純 GRU 專家
+    直接使用最後一個時間點的 Hidden State 進行預測
+    """
+
+    def __init__(self, input_size, hidden_size=32, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size, hidden_size, num_layers, batch_first=True, dropout=dropout
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        # 移除 Attention 相關層，保留最後的預測層
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1),
+        )
+
+    def forward(self, x):
+        # gru_out: [batch, seq, hidden] -> 包含每個時間點的輸出
+        # h_n: [num_layers, batch, hidden] -> 包含最後時間點的狀態
+        gru_out, h_n = self.gru(x)
+
+        # 取最後一層的最後一個時間點狀態 (Last Hidden State)
+        # h_n[-1] 形狀為 [batch, hidden]
+        last_hidden = h_n[-1]
+
+        context = self.dropout(last_hidden)
+
+        # 回傳預測值，以及 None (因為沒有 Attention Weight 了)
+        return self.fc(context), None
+
 
 class RawLSTM(nn.Module):
     """Base Branch: Standard LSTM"""
@@ -158,9 +194,9 @@ class AdvancedLearnableMoE(nn.Module):
 
         # --- C. Experts ---
         # Expert 1: Focuses on Trend (Low Freq)
-        self.expert_trend = AttentionExpert(input_size, hidden_size=32)
+        self.expert_trend = SimpleGRUExpert(input_size, hidden_size=32)
         # Expert 2: Focuses on Seasonal/Residual (High Freq)
-        self.expert_cyclic = AttentionExpert(input_size, hidden_size=32)
+        self.expert_cyclic = SimpleGRUExpert(input_size, hidden_size=32)
 
         # --- D. Gating Network ---
         # Inputs: Last Step (3) + Trend Mean (3) + Seasonal Mean (3) = 9 features
@@ -222,27 +258,34 @@ class AdvancedLearnableMoE(nn.Module):
 
 # ==================== 4. Loss Function ====================
 class HybridDirectionalLoss(nn.Module):
-    def __init__(self, direction_weight=0.5, penalty_scale=10.0):
+    def __init__(self, direction_weight=0.5):
         super().__init__()
         self.huber = nn.HuberLoss(delta=1.0)
         self.dir_weight = direction_weight
-        self.scale = penalty_scale
 
     def forward(self, pred, target, prev_value):
-        # Magnitude Loss
+        # 1. 數值精確度 (Magnitude)
         loss_val = self.huber(pred, target)
 
-        # Direction Loss (Soft Sign)
-        true_diff = target - prev_value
-        pred_diff = pred - prev_value
+        # 2. 方向懲罰 (Direction Penalty)
+        # 我們不關心波動大小，只關心：預測的 delta 和 真實的 delta 是否同號？
+        true_delta = target - prev_value
+        pred_delta = pred - prev_value
 
-        true_sign = torch.tanh(true_diff * 10)
-        pred_sign = torch.tanh(pred_diff * 10)
+        # 使用 tanh 模擬 sign 函數，但保持可微分
+        # 如果符號相同 (++) 或 (--)，乘積為正 -> tanh 為正
+        # 如果符號相反 (+-) 或 (-+)，乘積為負 -> tanh 為負
+        sign_agreement = torch.tanh(true_delta * 10) * torch.tanh(pred_delta * 10)
 
-        dir_loss = 1 - (true_sign * pred_sign)
-        weighted_dir = torch.mean(dir_loss * torch.abs(true_diff) * self.scale)
+        # 目標是 maximize sign_agreement (讓它接近 1)
+        # 所以 Loss 是 1 - sign_agreement
+        # 結果範圍：0 (方向完全正確) ~ 2 (方向完全相反)
+        dir_loss = torch.mean(1 - sign_agreement)
 
-        return (1 - self.dir_weight) * loss_val + self.dir_weight * weighted_dir
+        # 3. 組合
+        # 這裡的 dir_loss 不再受波動大小影響，即使波動很小，
+        # 只要方向錯了，Loss 就是 2，這會給模型很大的修正梯度！
+        return (1 - self.dir_weight) * loss_val + self.dir_weight * dir_loss
 
 
 # ==================== 5. Data Preparation (No MODWT Needed!) ====================
@@ -305,10 +348,10 @@ def prepare_data(df, vol_window=7, lookback=30, mode="NORMAL"):
     # 5. Sliding Window
     def create_sequences(data, lookback):
         X, y = [], []
-        for i in range(len(data) - lookback - 1):
+        for i in range(len(data) - lookback):
             X.append(data[i : i + lookback])
             # Target is the NEXT day's volatility (index 0)
-            y.append(data[i + lookback + 1, 0])
+            y.append(data[i + lookback, 0])
         return np.array(X), np.array(y)
 
     X_train, y_train = create_sequences(train_feat_scaled, lookback)
@@ -340,9 +383,9 @@ def prepare_data(df, vol_window=7, lookback=30, mode="NORMAL"):
 
 
 # ==================== 6. Training & Evaluation ====================
-def train_model(train_loader, test_loader, num_epochs=60, lr=0.001):
+def train_model(train_loader, test_loader, num_epochs=100, lr=0.001):
     model = AdvancedLearnableMoE().to(DEVICE)
-    criterion = HybridDirectionalLoss(direction_weight=0.2)
+    criterion = HybridDirectionalLoss(direction_weight=0.4)
 
     # Stage 1: Freeze Experts
     print("\n[Stage 1] Pre-training Base Branch...")
@@ -440,7 +483,8 @@ def evaluate_naive(targets_orig):
 
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     dir_acc = np.mean(np.sign(np.diff(y_true)) == np.sign(np.diff(y_pred)))
-    return rmse, dir_acc
+    r2 = r2_score(y_true, y_pred)
+    return rmse, dir_acc, r2
 
 
 def plot_alpha_distribution(alphas, save_path=None):
@@ -584,7 +628,7 @@ if __name__ == "__main__":
     dir_acc = np.mean(dir_true == dir_pred)
 
     # 4. Evaluate Naive Baseline
-    naive_rmse, naive_dir = evaluate_naive(targets)
+    naive_rmse, naive_dir, naive_r2 = evaluate_naive(targets)
 
     # 5. Report
     print("\n" + "=" * 60)
@@ -606,7 +650,7 @@ if __name__ == "__main__":
             f"{'Dir Accuracy':<15} | {dir_acc * 100:<12.2f}% | {naive_dir * 100:<12.2f}% | {'WIN 🏆' if dir_acc > naive_dir else 'Lose'}"
         )
         print(
-            f"{'R2 Score':<15} | {r2:<12.4f} | {'--':<12} | {'Good' if r2 > 0.8 else 'Low'}"
+            f"{'R2 Score':<15} | {r2:<12.4f} | {naive_r2:<12.4f} | {'Good' if r2 > 0.8 else 'Low'}"
         )
         print("-" * 60)
         print(
