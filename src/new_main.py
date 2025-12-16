@@ -47,9 +47,6 @@ print(f"[Setup] Device: {DEVICE} | Seed: {SEED}")
 
 # ==================== 1. Learnable Decomposition Layers (The SOTA Part) ====================
 class MovingAvg(nn.Module):
-    """
-    Learnable Moving Average Layer (from Autoformer)
-    """
 
     def __init__(self, kernel_size, stride):
         super(MovingAvg, self).__init__()
@@ -71,11 +68,6 @@ class MovingAvg(nn.Module):
 
 
 class SeriesDecomp(nn.Module):
-    """
-    End-to-End Series Decomposition Block
-    Input: Raw Series
-    Output: Trend Part, Seasonal (Residual) Part
-    """
 
     def __init__(self, kernel_size):
         super(SeriesDecomp, self).__init__()
@@ -88,44 +80,6 @@ class SeriesDecomp(nn.Module):
 
 
 # ==================== 2. Expert & Base Networks ====================
-class AttentionExpert(nn.Module):
-    """GRU-based Expert with Temporal Attention"""
-
-    def __init__(self, input_size, hidden_size=32, num_layers=2, dropout=0.2):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size, hidden_size, num_layers, batch_first=True, dropout=dropout
-        )
-        self.dropout = nn.Dropout(dropout)
-
-        # Attention Mechanism
-        self.attention_query = nn.Linear(hidden_size, 16)
-        self.attention_key = nn.Linear(hidden_size, 16)
-        self.attention_score = nn.Linear(16, 1)
-
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
-        )
-
-    def forward(self, x):
-        gru_out, h_n = self.gru(x)
-
-        # Attention: Query (Last State) vs Keys (All States)
-        query = h_n[-1]  # [batch, hidden]
-
-        query_proj = self.attention_query(query).unsqueeze(1)  # [batch, 1, 16]
-        key_proj = self.attention_key(gru_out)  # [batch, seq, 16]
-
-        attn_logits = self.attention_score(torch.tanh(query_proj + key_proj))
-        attn_weights = torch.softmax(attn_logits.squeeze(-1), dim=1)
-
-        context = torch.sum(gru_out * attn_weights.unsqueeze(-1), dim=1)
-        context = self.dropout(context)
-        return self.fc(context), attn_weights
-
 class SimpleGRUExpert(nn.Module):
     """
     沒有 Attention 的單純 GRU 專家
@@ -275,7 +229,7 @@ class HybridDirectionalLoss(nn.Module):
         # 使用 tanh 模擬 sign 函數，但保持可微分
         # 如果符號相同 (++) 或 (--)，乘積為正 -> tanh 為正
         # 如果符號相反 (+-) 或 (-+)，乘積為負 -> tanh 為負
-        sign_agreement = torch.tanh(true_delta * 10) * torch.tanh(pred_delta * 10)
+        sign_agreement = torch.tanh(true_delta * 5) * torch.tanh(pred_delta * 5)
 
         # 目標是 maximize sign_agreement (讓它接近 1)
         # 所以 Loss 是 1 - sign_agreement
@@ -401,11 +355,22 @@ def train_model(train_loader, test_loader, num_epochs=100, lr=0.001):
             )
             optimizer.zero_grad()
 
-            # Forward (Ignore experts for loss calculation here to enforce base learning)
-            # Or simpler: just backward on the full output but only update base params
-            out, _, _, _, _, _ = model(x)
+            # =================================================
+            # 【關鍵修正】
+            # 1. 不呼叫 model(x)，因為那會跑去算 Expert 和 Gating
+            #    我們直接單獨呼叫 base_branch，拿到純淨的 delta
+            # =================================================
+            base_delta = model.base_branch(x)
+
+            # 2. 【尺度修正】手動還原成絕對數值 (Prediction = Prev + Delta)
+            #    這樣才能跟 Target (y) 在同一個基準上比較
             prev_val = x[:, -1, 0:1]
-            loss = criterion(out, y, prev_val)
+            stage1_pred = prev_val + base_delta
+
+            # 3. 計算 Loss
+            #    這時候的 stage1_pred 是純粹由 LSTM 算出來的預測值
+            loss = criterion(stage1_pred, y, prev_val)
+
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
@@ -414,7 +379,7 @@ def train_model(train_loader, test_loader, num_epochs=100, lr=0.001):
             print(f"  Epoch {epoch + 1} | Loss: {np.mean(losses):.4f}")
 
     # Stage 2: Joint Training
-    print("\n[Stage 2] Joint Training (Learning Decomposition)...")
+    print("\n[Stage 2] Joint Training ...")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr * 0.5)  # Lower LR
 
     history = {"loss": [], "alpha": []}
@@ -474,6 +439,28 @@ def evaluate(model, loader, scaler, mean_vol):
 
     return preds_orig, targets_orig, alphas
 
+def analyze_high_volatility(targets, preds):
+    """
+    分析模型在「大波動」日子的表現 vs 整體表現
+    targets, preds 都是原始數值 (Inverse Transformed)
+    """
+    # 1. 對齊數據 (計算 Delta 需要 t 與 t-1)
+    true_delta = targets[1:] - targets[:-1]
+    pred_delta = preds[1:] - targets[:-1]
+
+    # 2. 計算方向是否正確
+    dir_correct = (np.sign(true_delta) == np.sign(pred_delta))
+
+    # 3. 定義「大行情」 (Top 20% 的波動幅度)
+    magnitude = np.abs(true_delta)
+    threshold = np.percentile(magnitude, 80)
+    high_vol_mask = magnitude > threshold
+
+    # 4. 計算準確率
+    acc_overall = np.mean(dir_correct)
+    acc_high_vol = np.mean(dir_correct[high_vol_mask])
+
+    return acc_overall, acc_high_vol, threshold
 
 def evaluate_naive(targets_orig):
     # Lag-1 Prediction: Pred[t] = Target[t-1]
@@ -606,8 +593,7 @@ def plot_zoom_check(targets, preds, save_path=None):
 if __name__ == "__main__":
     os.makedirs("../results", exist_ok=True)
 
-    # 1. Prepare Data (Mode: NORMAL, SANITY_TARGET_SHUFFLE, or SANITY_INPUT_SHUFFLE)
-    # Change mode here to test!
+    # 1. Prepare Data
     df = pd.read_csv(dataset_path)
     train_loader, test_loader, scalers, mean_vol, mode = prepare_data(df, mode="NORMAL")
 
@@ -617,60 +603,72 @@ if __name__ == "__main__":
     # 3. Evaluate Model
     preds, targets, alphas = evaluate(model, test_loader, scalers["target"], mean_vol)
 
-    # Metrics
-    rmse = np.sqrt(mean_squared_error(targets, preds))
-    mae = mean_absolute_error(targets, preds)
-    r2 = r2_score(targets, preds)
-
-    # True Direction Accuracy (Actual Trend)
-    dir_true = np.sign(np.diff(targets))
-    dir_pred = np.sign(np.diff(preds))
-    dir_acc = np.mean(dir_true == dir_pred)
-
-    # 4. Evaluate Naive Baseline
+    # 4. Evaluate Naive Baseline (這裡會算出 naive_dir)
     naive_rmse, naive_dir, naive_r2 = evaluate_naive(targets)
 
-    # 5. Report
+    # 5. Metrics Calculation
+    rmse = np.sqrt(mean_squared_error(targets, preds))
+    r2 = r2_score(targets, preds)
+
+    # ★★★ 呼叫大行情分析 (取得 acc_overall) ★★★
+    acc_overall, acc_high_vol, vol_threshold = analyze_high_volatility(targets, preds)
+
+    # ★★★ 計算差異：我們的新指標 vs Naive 指標 ★★★
+    improvement = acc_high_vol - acc_overall # 這是比較大行情 vs 整體
+
+    # 這是比較 Model vs Naive
+    win_naive = acc_overall > naive_dir
+
+    # 6. Final Report
     print("\n" + "=" * 60)
+
     if "SANITY" in mode:
         print(f"⚠️ SANITY CHECK REPORT ({mode})")
         print(f"R2 Score: {r2:.4f} (Should be < 0)")
-        print(f"Dir Acc:  {dir_acc * 100:.2f}% (Should be ~50%)")
+        print(f"Dir Acc:  {acc_overall * 100:.2f}% (Should be ~50%)")
     else:
         print("✅ FINAL PRODUCTION REPORT (E2E-FAR-MoE)")
         print("-" * 60)
-        print(
-            f"{'Metric':<15} | {'Our Model':<12} | {'Naive (Lag-1)':<12} | {'Status'}"
-        )
+        print(f"{'Metric':<15} | {'Our Model':<12} | {'Naive (Lag-1)':<12} | {'Status'}")
         print("-" * 60)
-        print(
-            f"{'RMSE':<15} | {rmse:<12.4f} | {naive_rmse:<12.4f} | {'Comparable' if abs(rmse - naive_rmse) < 0.1 else 'Check'}"
-        )
-        print(
-            f"{'Dir Accuracy':<15} | {dir_acc * 100:<12.2f}% | {naive_dir * 100:<12.2f}% | {'WIN 🏆' if dir_acc > naive_dir else 'Lose'}"
-        )
-        print(
-            f"{'R2 Score':<15} | {r2:<12.4f} | {naive_r2:<12.4f} | {'Good' if r2 > 0.8 else 'Low'}"
-        )
-        print("-" * 60)
-        print(
-            f"Mean Alpha: {alphas.mean():.4f} (Model is {'Adaptive' if 0.2 < alphas.mean() < 0.8 else 'Biased'})"
-        )
 
-        # Plotting
+        # RMSE
+        print(f"{'RMSE':<15} | {rmse:<12.4f} | {naive_rmse:<12.4f} | {'Comparable' if abs(rmse - naive_rmse) < 0.1 else 'Check'}")
+
+        # R2
+        print(f"{'R2 Score':<15} | {r2:<12.4f} | {naive_r2:<12.4f} | {'Good' if r2 > 0.8 else 'Low'}")
+
+        # ★★★ [這裡補上] 方向準確率比較 ★★★
+        # 使用 acc_overall (Model) 對決 naive_dir (Baseline)
+        status = "WIN" if win_naive else "LOSE"
+        print(f"{'Dir Accuracy':<15} | {acc_overall * 100:<12.2f}% | {naive_dir * 100:<12.2f}% | {status}")
+
+
+        # Deep Dive (保持不變)
+        print("-" * 60)
+        print("[Direction Accuracy Deep Dive] 🎯")
+        print(f"整體方向準確率 (Overall):       {acc_overall * 100:.2f}%")
+        print(f"大行情準確率 (Top 20% Vol):     {acc_high_vol * 100:.2f}%  (Threshold > {vol_threshold:.4f})")
+
+        # 這裡的 Improvement 是指「大行情有沒有比整體準」
+        imp_status = "Positive" if improvement > 0 else "Negative"
+        print(f"大行情提升幅度:                 {improvement * 100:+.2f}%  ({imp_status})")
+
+        print("-" * 60)
+        print(f"Mean Alpha: {alphas.mean():.4f}")
+
+        # Plotting (保持不變)
         plot_alpha_distribution(alphas, save_path / "alpha_dist.png")
-        plot_learned_decomposition(
-            model, test_loader, save_path / "learned_decomposition.png"
-        )
+        plot_learned_decomposition(model, test_loader, save_path / "learned_decomposition.png")
         plot_zoom_check(targets, preds, save_path / "zoom_check.png")
 
         # Prediction Plot
         plt.figure(figsize=(12, 6))
         plt.plot(targets, label="Actual Volatility", color="black", alpha=0.6)
         plt.plot(preds, label="E2E-MoE Prediction", color="blue", alpha=0.8)
-        plt.title(f"Forecast vs Actual (Dir Acc: {dir_acc * 100:.2f}%)")
+        plt.title(f"Forecast vs Actual (Overall Dir Acc: {acc_overall * 100:.2f}%)")
         plt.legend()
-        plt.savefig("../results/final_forecast.png")
+        plt.savefig(save_path / "final_forecast.png")
         print("✓ Forecast plot saved.")
 
     print("=" * 60 + "\n")
