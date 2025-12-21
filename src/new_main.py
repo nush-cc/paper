@@ -20,6 +20,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from pathlib import Path
 import matplotlib.pyplot as plt
 import warnings
+import seaborn as sns
 import random
 
 
@@ -141,7 +142,7 @@ class AdvancedLearnableMoE(nn.Module):
 
         # --- A. Learnable Decomposition (The Innovation) ---
         # Kernel 25 ~= 1 month of trading days (extracts long-term trend)
-        self.decomp = SeriesDecomp(kernel_size=25)
+        self.decomp = SeriesDecomp(kernel_size=15)
 
         # --- B. Base Branch (Anchor) ---
         self.base_branch = RawLSTM(input_size, hidden_size)
@@ -159,13 +160,15 @@ class AdvancedLearnableMoE(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(64, 2),  # 2 Experts
-            nn.Softmax(dim=1),
         )
 
         # --- E. Meta-Gate (Alpha) ---
         self.meta_gate = nn.Sequential(
-            nn.Linear(9, 32), nn.ReLU(), nn.Linear(32, 1), nn.Sigmoid()
+            nn.Linear(9, 32), nn.ReLU(), nn.Linear(32, 1)
         )
+
+        nn.init.constant_(self.meta_gate[-1].bias, 0.0)
+        nn.init.xavier_uniform_(self.meta_gate[-1].weight, gain=0.01) # 權重也設小一點
 
     def forward(self, x):
         # x: [Batch, Seq, Features]
@@ -186,13 +189,20 @@ class AdvancedLearnableMoE(nn.Module):
         seasonal_mean = seasonal_part.mean(dim=1)
         context = torch.cat([last_step, trend_mean, seasonal_mean], dim=1)
 
-        # 5. Gating Weights
-        expert_weights = self.gating(context)  # [Batch, 2]
+        # 5. Gating Weights (With Temperature Sharpening)
+        gating_logits = self.gating(context)  # [Batch, 2]
+
+        # ★★★ 修改點 2: 設定溫度係數 (T) ★★★
+        # T 越小，分佈越極端 (雙峰)。建議嘗試 0.1, 0.2, 0.5
+        temperature = 0.1
+        expert_weights = torch.softmax(gating_logits / temperature, dim=1)
+
         w_trend, w_cyclic = expert_weights[:, 0:1], expert_weights[:, 1:2]
 
         # 6. Residual Fusion
         moe_delta = (w_trend * pred_trend) + (w_cyclic * pred_cyclic)
-        alpha = self.meta_gate(context)
+        alpha_logit = self.meta_gate(context)
+        alpha = torch.sigmoid(alpha_logit)
 
         # 7. Final Output (Anchor + Residual)
         # Prev Value is Volatility (Index 0 in feature list)
@@ -229,7 +239,8 @@ class HybridDirectionalLoss(nn.Module):
         # 使用 tanh 模擬 sign 函數，但保持可微分
         # 如果符號相同 (++) 或 (--)，乘積為正 -> tanh 為正
         # 如果符號相反 (+-) 或 (-+)，乘積為負 -> tanh 為負
-        sign_agreement = torch.tanh(true_delta * 5) * torch.tanh(pred_delta * 5)
+        # check
+        sign_agreement = torch.tanh(true_delta * 10) * torch.tanh(pred_delta * 10)
 
         # 目標是 maximize sign_agreement (讓它接近 1)
         # 所以 Loss 是 1 - sign_agreement
@@ -377,6 +388,60 @@ def train_model(train_loader, test_loader, num_epochs=100, lr=0.001):
 
         if (epoch + 1) % 10 == 0:
             print(f"  Epoch {epoch + 1} | Loss: {np.mean(losses):.4f}")
+    #
+    # # [Stage 1.5] Expert Warm-up (關鍵新增)
+    # print("\n[Stage 1.5] Warming up Experts (Alpha=1 forced)...")
+    # # 凍結 Base
+    # for param in model.base_branch.parameters():
+    #     param.requires_grad = False
+    #
+    # # 訓練 Experts (Trend/Cyclic) 和 Gating
+    # optimizer_exp = torch.optim.Adam([
+    #     {'params': model.expert_trend.parameters()},
+    #     {'params': model.expert_cyclic.parameters()},
+    #     {'params': model.gating.parameters()}
+    # ], lr=lr)
+    #
+    # for epoch in range(10): # 短暫預熱 10 個 Epoch
+    #     model.train()
+    #     for batch in train_loader:
+    #         x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE).unsqueeze(-1)
+    #         optimizer_exp.zero_grad()
+    #
+    #         # 強制只訓練 Expert 部分，假設 Alpha=1
+    #         # 我們需要手動呼叫 forward 的內部邏輯，或者在 model 加一個 warmup 模式
+    #         # 這裡用一個簡化寫法：直接拿 moe_delta 算 Loss
+    #
+    #         seasonal_part, trend_part = model.decomp(x)
+    #         pred_trend, _ = model.expert_trend(trend_part)
+    #         pred_cyclic, _ = model.expert_cyclic(seasonal_part)
+    #
+    #         # Gating
+    #         last_step = x[:, -1, :]
+    #         trend_mean = trend_part.mean(dim=1)
+    #         seasonal_mean = seasonal_part.mean(dim=1)
+    #         context = torch.cat([last_step, trend_mean, seasonal_mean], dim=1)
+    #         expert_weights = model.gating(context)
+    #
+    #         moe_delta = (expert_weights[:, 0:1] * pred_trend) + (expert_weights[:, 1:2] * pred_cyclic)
+    #
+    #         # 讓 Experts 試著去預測 "殘差" (Target - Base_Prediction)
+    #         with torch.no_grad():
+    #             base_delta = model.base_branch(x)
+    #             prev_val = x[:, -1, 0:1]
+    #             # 目標是：Expert 應該要把 Base 沒預測準的部分補起來
+    #             # Residual Target = (True_Target - Prev) - Base_Delta
+    #             residual_target = (y - prev_val) - base_delta
+    #
+    #         # 這裡只算 MSE 讓 Expert 快速收斂
+    #         loss = nn.MSELoss()(moe_delta, residual_target)
+    #         loss.backward()
+    #         optimizer_exp.step()
+    #     print(f"  Warmup Epoch {epoch+1}")
+    #
+    # # 解凍 Base，準備進入 Stage 2
+    # for param in model.base_branch.parameters():
+    #     param.requires_grad = True
 
     # Stage 2: Joint Training
     print("\n[Stage 2] Joint Training ...")
@@ -420,24 +485,27 @@ def train_model(train_loader, test_loader, num_epochs=100, lr=0.001):
 @torch.no_grad()
 def evaluate(model, loader, scaler, mean_vol):
     model.eval()
-    preds, targets, alphas = [], [], []
+    preds, targets, alphas, expert_weights_list = [], [], [], []
 
     for batch in loader:
         x, y = batch["raw_input"].to(DEVICE), batch["target"].to(DEVICE)
-        out, _, _, _, _, alpha = model(x)
+        out, _, _, weights, _, alpha = model(x)
         preds.append(out.cpu().numpy())
         targets.append(y.cpu().numpy())
         alphas.append(alpha.cpu().numpy())
+        expert_weights_list.append(weights.cpu().numpy()) # [Batch, 2]
 
     preds = np.concatenate(preds).flatten()
     targets = np.concatenate(targets).flatten()
     alphas = np.concatenate(alphas).flatten()
 
+    all_weights = np.concatenate(expert_weights_list, axis=0)
+
     # Inverse Transform
     preds_orig = scaler.inverse_transform(preds.reshape(-1, 1)).flatten()
     targets_orig = scaler.inverse_transform(targets.reshape(-1, 1)).flatten()
 
-    return preds_orig, targets_orig, alphas
+    return preds_orig, targets_orig, alphas, all_weights
 
 def analyze_high_volatility(targets, preds):
     """
@@ -519,15 +587,15 @@ def plot_learned_decomposition(model, test_loader, save_path=None):
     axes[0].legend()
 
     axes[1].plot(
-        trend_seq, label="Learned Trend (Low Freq)", color="green", linewidth=2
+        trend_seq, label="Trend (Low Freq)", color="green", linewidth=2
     )
-    axes[1].set_title("End-to-End Learned Trend")
+    axes[1].set_title("Trend")
     axes[1].legend()
 
     axes[2].plot(
-        seasonal_seq, label="Learned Seasonal (Residual)", color="orange", linewidth=2
+        seasonal_seq, label="Seasonal (Residual)", color="orange", linewidth=2
     )
-    axes[2].set_title("End-to-End Learned Seasonal/Residual")
+    axes[2].set_title("Seasonal/Residual")
     axes[2].legend()
 
     plt.tight_layout()
@@ -535,6 +603,137 @@ def plot_learned_decomposition(model, test_loader, save_path=None):
     plt.close()
     print(f"✓ Decomposition plot saved: {save_path}")
 
+def plot_expert_analysis(weights_data, save_path=None):
+    if save_path is None:
+        raise ValueError("路徑為空")
+
+    # weights_data: shape [N, 2], column 0=Trend, column 1=Cyclic
+
+    # 設定風格
+    sns.set_theme(style="whitegrid")
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+
+    # --- 子圖 1: 時間序列堆疊圖 ---
+    time_steps = range(len(weights_data))
+    axes[0].stackplot(time_steps,
+                      weights_data[:, 0], # Trend
+                      weights_data[:, 1], # Cyclic
+                      labels=['Trend Expert', 'Cyclic Expert'],
+                      colors=['#1f77b4', '#ff7f0e'],
+                      alpha=0.8)
+    axes[0].set_title('Dynamic Expert Weight Allocation Over Time', fontsize=14, fontweight='bold')
+    axes[0].set_xlabel('Time Step (Test Set)')
+    axes[0].set_ylabel('Gate Weight')
+    axes[0].legend(loc='upper right')
+
+    # ★★★ 修正這裡 ★★★
+    # 原本錯誤: axes[0].set_xmargin(0, 0) 或 axes[0].set_margins(0, 0)
+    # 正確寫法: 指定 x 軸留白為 0
+    axes[0].margins(x=0)
+
+    # --- 子圖 2: 權重密度分佈 (KDE) ---
+    sns.kdeplot(data=weights_data[:, 0], ax=axes[1], color='#1f77b4', fill=True, label='Trend Expert', alpha=0.3, clip=(0,1))
+    sns.kdeplot(data=weights_data[:, 1], ax=axes[1], color='#ff7f0e', fill=True, label='Cyclic Expert', alpha=0.3, clip=(0,1))
+
+    axes[1].set_title('Distribution of Expert Weights (Specialization Check)', fontsize=14, fontweight='bold')
+    axes[1].set_xlabel('Weight Value (0 to 1)')
+    axes[1].set_ylabel('Density')
+    axes[1].legend()
+    axes[1].grid(axis='y', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+    # 恢復 matplotlib 預設風格
+    sns.reset_orig()
+    print(f"✓ Expert weights plot saved: {save_path}")
+
+
+def plot_metric_comparison(metrics_dict, save_path=None):
+    """
+    動態調整子圖數量，適用於繪製 RMSE 和 R2
+    """
+    if save_path is None: raise ValueError("路徑為空")
+
+    metrics_names = list(metrics_dict.keys())
+    num_metrics = len(metrics_names) # 自動計算有幾個指標
+
+    # 設定畫布：動態寬度
+    fig, axes = plt.subplots(1, num_metrics, figsize=(6 * num_metrics, 6))
+
+    # 如果只有一個指標，axes 不會是 list，需要轉一下以便迴圈通用 (雖然這裡我們預計會有 2 個)
+    if num_metrics == 1: axes = [axes]
+
+    color_model = '#2ca02c'  # 綠色
+    color_naive = '#7f7f7f'  # 灰色
+
+    for idx, metric in enumerate(metrics_names):
+        ax = axes[idx]
+        model_val = metrics_dict[metric][0]
+        naive_val = metrics_dict[metric][1]
+
+        x_labels = ['Our Model', 'Naive']
+        values = [model_val, naive_val]
+        colors = [color_model, color_naive]
+
+        bars = ax.bar(x_labels, values, color=colors, alpha=0.8, width=0.6)
+
+        ax.set_title(metric, fontweight='bold', fontsize=14)
+        ax.grid(axis='y', linestyle='--', alpha=0.5)
+
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.4f}' if height < 10 else f'{height:.2f}',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3),
+                        textcoords="offset points",
+                        ha='center', va='bottom', fontweight='bold', fontsize=12)
+
+    fig.suptitle('Regression Metrics Comparison', fontsize=16, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(save_path)
+    plt.close()
+    print(f"✓ Regression metrics plot saved: {save_path}")
+
+def plot_performance_comparison(overall_acc, high_vol_acc, naive_overall, naive_high_vol, save_path=None):
+    if save_path is None: raise ValueError("路徑為空")
+
+    categories = ['Overall Accuracy', 'High Volatility\nDirectional Acc.']
+    model_scores = [overall_acc, high_vol_acc]
+    naive_scores = [naive_overall, naive_high_vol]
+
+    x = np.arange(len(categories))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
+    # 你的模型 (深紫色)
+    rects1 = ax.bar(x - width/2, model_scores, width, label='Proposed Model', color='#845EC2', edgecolor='black', alpha=0.9, zorder=3)
+    # Naive Baseline (灰色 + 斜線)
+    rects2 = ax.bar(x + width/2, naive_scores, width, label='Naive Baseline', color='#B0A8B9', edgecolor='black', hatch='//', zorder=3)
+
+    ax.set_ylabel('Accuracy', fontsize=12)
+    ax.set_title('Performance Comparison: Model vs Naive Baseline', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories, fontsize=11)
+    ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=10, loc='upper left')
+    ax.yaxis.grid(True, linestyle='--', alpha=0.7, zorder=0)
+
+    def autolabel(rects):
+        for rect in rects:
+            height = rect.get_height()
+            ax.annotate(f'{height:.1%}', xy=(rect.get_x() + rect.get_width() / 2, height),
+                        xytext=(0, 5), textcoords="offset points", ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+    autolabel(rects1)
+    autolabel(rects2)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"✓ Performance comparison plot saved: {save_path}")
 
 # ==================== 8. Leakage Zoom-In Check (Add this to the end) ====================
 def plot_zoom_check(targets, preds, save_path=None):
@@ -601,7 +800,7 @@ if __name__ == "__main__":
     model, history = train_model(train_loader, test_loader)
 
     # 3. Evaluate Model
-    preds, targets, alphas = evaluate(model, test_loader, scalers["target"], mean_vol)
+    preds, targets, alphas, expert_weights = evaluate(model, test_loader, scalers["target"], mean_vol)
 
     # 4. Evaluate Naive Baseline (這裡會算出 naive_dir)
     naive_rmse, naive_dir, naive_r2 = evaluate_naive(targets)
@@ -618,6 +817,32 @@ if __name__ == "__main__":
 
     # 這是比較 Model vs Naive
     win_naive = acc_overall > naive_dir
+
+    # 7. 計算 Naive 在高波動下的表現 (為了畫圖比較)
+    # 邏輯：Naive 預測方向 = 昨天的方向 (Momentum)
+    # 我們必須對齊數據：
+    # true_delta_all: 從 t=1 到 t=N 的真實變化
+    true_delta_all = targets[1:] - targets[:-1]
+
+    # 我們比較範圍：從 index 1 開始 (因為第 0 個數據沒有"昨天")
+    # True Direction (今天): targets[t] - targets[t-1]
+    true_dir_aligned = np.sign(true_delta_all[1:])
+
+    # Naive Prediction (猜跟昨天一樣): targets[t-1] - targets[t-2]
+    naive_dir_aligned = np.sign(true_delta_all[:-1])
+
+    # 找出對應的高波動日子
+    magnitude_aligned = np.abs(true_delta_all[1:])
+    high_vol_mask_naive = magnitude_aligned > vol_threshold
+
+    # 計算 Naive 在這些日子的準確率
+    naive_correct_mask = (true_dir_aligned == naive_dir_aligned)
+    if np.sum(high_vol_mask_naive) > 0:
+        naive_high_vol_acc = np.mean(naive_correct_mask[high_vol_mask_naive])
+    else:
+        naive_high_vol_acc = 0.5 # 防止分母為 0
+
+    improvement = acc_high_vol - acc_overall # 這是比較大行情 vs 整體
 
     # 6. Final Report
     print("\n" + "=" * 60)
@@ -659,8 +884,9 @@ if __name__ == "__main__":
 
         # Plotting (保持不變)
         plot_alpha_distribution(alphas, save_path / "alpha_dist.png")
-        plot_learned_decomposition(model, test_loader, save_path / "learned_decomposition.png")
+        plot_learned_decomposition(model, test_loader, save_path / "decomposition.png")
         plot_zoom_check(targets, preds, save_path / "zoom_check.png")
+        plot_expert_analysis(expert_weights, save_path / "expert_analysis.png")
 
         # Prediction Plot
         plt.figure(figsize=(12, 6))
@@ -670,5 +896,23 @@ if __name__ == "__main__":
         plt.legend()
         plt.savefig(save_path / "final_forecast.png")
         print("✓ Forecast plot saved.")
+
+        # 1. 繪製數值回歸指標 (RMSE & R2)
+        # 這裡不放 Dir Acc，因為會在下一張圖專門畫
+        regression_metrics = {
+            'RMSE (Lower is better)': (rmse, naive_rmse),
+            'R2 Score (Higher is better)': (r2, naive_r2)
+        }
+        plot_metric_comparison(regression_metrics, save_path / "metric_comparison.png")
+
+        # 2. 繪製方向準確度指標 (Overall vs High Volatility)
+        # 這張圖專門負責講 "方向預測" 的故事
+        plot_performance_comparison(
+            overall_acc=acc_overall,
+            high_vol_acc=acc_high_vol,
+            naive_overall=naive_dir,
+            naive_high_vol=naive_high_vol_acc,
+            save_path=save_path / "performance_comparison.png"
+        )
 
     print("=" * 60 + "\n")
