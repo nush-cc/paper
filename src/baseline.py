@@ -1,15 +1,13 @@
 """
-Complete Baseline Evaluation for Volatility Prediction
-======================================================
-Models Evaluated:
-1. Naive (Lag-1): Predicts t using t-1 (The "Mirror" Test)
-2. Moving Average: Simple sliding window average
-3. GARCH(1,1): Statistical baseline
-4. Single GRU: Neural baseline (No experts)
-5. Single LSTM: Neural baseline (No experts)
+Baseline Suite for Multi-Step Forecasting (Horizon=3)
+=====================================================
+Features: Includes V2 enhanced features (MACD, BB_Width) for fair comparison.
+Models:
+1. Naive (Persistence): Pred(t+H) = Actual(t)
+2. XGBoost (ML SOTA)
+3. Vanilla LSTM (DL SOTA)
 
-* Comparison target: MODWT-MoE (Your proposed model)
-* Data Processing: Strictly aligned with MoE (80/20 Split + Centering + Scaling)
+Run: python baseline_horizon.py
 """
 
 import os
@@ -19,388 +17,264 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score
+from pathlib import Path
 import matplotlib.pyplot as plt
+import xgboost as xgb
 import warnings
-warnings.filterwarnings('ignore')
+import random
 
-# ==================== Configuration ====================
+warnings.filterwarnings("ignore")
+os.environ["avg_verbose"] = "0"
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+dataset_path = BASE_DIR / "dataset" / "GBP_TWD.csv"
+save_path = BASE_DIR / "results" / "baseline_horizon_3"
+
+if not save_path.exists():
+    save_path.mkdir(parents=True, exist_ok=True)
+
+# 設定 Horizon = 3 (與你的 V2 保持一致)
+HORIZON = 3
+SEED = 5827
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = 42 # 固定種子以確保 Neural Networks 結果可重現
-torch.manual_seed(SEED)
-np.random.seed(SEED)
 
-print(f"[Setup] Device: {DEVICE} | Seed: {SEED}")
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
 
+set_seed(SEED)
 
-# ==================== Dataset Class ====================
-class SimpleVolatilityDataset(Dataset):
-    """Simple dataset for neural baselines"""
-    def __init__(self, data, window=30, forecast_horizon=1):
-        self.X = []
-        self.y = []
-        for i in range(len(data) - window - forecast_horizon + 1):
-            self.X.append(data[i:i+window])
-            self.y.append(data[i+window+forecast_horizon-1])
-        self.X = torch.FloatTensor(np.array(self.X)).unsqueeze(-1)
-        self.y = torch.FloatTensor(np.array(self.y)).unsqueeze(-1)
+# ==================== 1. Data Preparation (Fair Fight) ====================
+class VolatilityDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, idx): return {"raw_input": self.X[idx], "target": self.y[idx]}
 
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-
-# ==================== Models ====================
-
-# 1. Naive Model
-class NaiveModel:
-    """
-    Naive Baseline: Predicts t using t-1
-    """
-    def __init__(self):
-        self.name = "Naive (Lag-1)"
-
-    def evaluate(self, data):
-        """
-        Evaluate on data[1:] vs data[:-1]
-        data: 1D numpy array of volatility
-        """
-        # Targets: Real values from t=1 to end
-        targets = data[1:]
-        # Predictions: Values from t=0 to end-1 (shifted forward)
-        predictions = data[:-1]
-
-        rmse = np.sqrt(mean_squared_error(targets, predictions))
-        mae = mean_absolute_error(targets, predictions)
-        r2 = r2_score(targets, predictions)
-        
-        # Naive Direction (Momentum Persistence)
-        # Check if trend continues: sign(t - t-1) vs sign(t-1 - t-2)
-        if len(targets) > 1:
-            prev_diff = predictions[1:] - predictions[:-1]
-            curr_diff = targets[1:] - targets[:-1]
-            direction_acc = np.mean(np.sign(prev_diff) == np.sign(curr_diff))
-        else:
-            direction_acc = 0.5
-
-        return {
-            'rmse': rmse, 'mae': mae, 'r2': r2, 'direction_acc': direction_acc
-        }, predictions, targets
-
-# 2. Moving Average
-class MovingAverageModel:
-    def __init__(self, window=5):
-        self.window = window
-        self.name = f"Moving Average (w={window})"
-
-    def evaluate(self, data):
-        predictions = []
-        # Simple rolling mean
-        series = pd.Series(data)
-        preds_series = series.rolling(window=self.window).mean().shift(1) # Predict t using t-1...t-w
-        
-        # Align data (remove NaNs)
-        valid_idx = ~np.isnan(preds_series)
-        predictions = preds_series[valid_idx].values
-        targets = series[valid_idx].values
-
-        rmse = np.sqrt(mean_squared_error(targets, predictions))
-        mae = mean_absolute_error(targets, predictions)
-        r2 = r2_score(targets, predictions)
-        
-        direction_acc = np.mean(np.sign(np.diff(predictions)) == np.sign(np.diff(targets)))
-
-        return {
-            'rmse': rmse, 'mae': mae, 'r2': r2, 'direction_acc': direction_acc
-        }, predictions, targets
-
-# 3. GARCH(1,1)
-class GARCHModel:
-    def __init__(self):
-        self.name = "GARCH(1,1)"
-
-    def fit_predict(self, train_vol, test_vol, vol_window=7):
-        try:
-            from arch import arch_model
-            predictions = []
-            # Rolling forecast simulation
-            # Note: For speed, we might just fit once or use a window. 
-            # Here we implement a simple rolling window mean as fallback if too slow, 
-            # but let's try a simple expanding window approach.
-            
-            # Since GARCH is slow to re-fit every step, we use a simplified approach:
-            # Fit on Train, predict Test (Expanding) - or just Rolling Mean if arch fails.
-            
-            # For this script, to ensure robustness without 'arch' package dependency causing crash:
-            # We will use an Exponential Moving Average (EMA) as a proxy for GARCH-like behavior
-            # if arch is missing, or actual GARCH if present.
-            
-            # Using EMA as a strong statistical baseline (often beats GARCH in simple setups)
-            full_data = np.concatenate([train_vol, test_vol])
-            series = pd.Series(full_data)
-            # Span derived from typical GARCH parameters
-            preds_series = series.ewm(span=vol_window*2, adjust=False).mean().shift(1)
-            
-            predictions = preds_series.iloc[len(train_vol):].values
-            
-            return predictions
-
-        except ImportError:
-            # Fallback to EMA
-            full_data = np.concatenate([train_vol, test_vol])
-            series = pd.Series(full_data)
-            preds_series = series.ewm(span=vol_window*2, adjust=False).mean().shift(1)
-            return preds_series.iloc[len(train_vol):].values
-
-# 4 & 5. Neural Networks (GRU/LSTM)
-class SingleRNN(nn.Module):
-    def __init__(self, cell_type='GRU', input_size=1, hidden_size=64, num_layers=2, dropout=0.2):
-        super().__init__()
-        if cell_type == 'GRU':
-            self.rnn = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        else:
-            self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 1)
-        )
-
-    def forward(self, x):
-        out, _ = self.rnn(x)
-        out = out[:, -1, :] # Last time step
-        return self.fc(self.dropout(out))
-
-# Loss
-class HuberLoss(nn.Module):
-    def __init__(self, delta=1.0):
-        super().__init__()
-        self.delta = delta
-    def forward(self, pred, target):
-        error = torch.abs(pred - target)
-        quadratic = torch.clamp(error, max=self.delta)
-        linear = error - quadratic
-        return (0.5 * quadratic ** 2 + self.delta * linear).mean()
-
-# Training Helpers
-def train_model(model, train_loader, test_loader, num_epochs=50, device=DEVICE):
-    model = model.to(device)
-    criterion = HuberLoss(delta=1.0)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    for epoch in range(num_epochs):
-        model.train()
-        for X, y in train_loader:
-            X, y = X.to(device), y.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(X), y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-    return model
-
-@torch.no_grad()
-def get_preds(model, loader, device):
-    model.eval()
-    preds, targets = [], []
-    for X, y in loader:
-        X, y = X.to(device), y.to(device)
-        preds.append(model(X).cpu().numpy())
-        targets.append(y.cpu().numpy())
-    return np.concatenate(preds).flatten(), np.concatenate(targets).flatten()
-
-
-# ==================== Main Evaluation Logic ====================
-def evaluate_all_baselines(df, vol_window=7, lookback=30, train_ratio=0.80):
-    
-    print("\n" + "="*60)
-    print("[Data Prep] Aligned with MODWT-MoE (Centering + Scaling)")
-    print("="*60)
-
-    # 1. Feature Engineering
+def prepare_data_fair(df, vol_window=7, lookback=30, horizon=3):
+    print(f"[Data] Preparing Horizon={horizon} dataset with Enhanced Features...")
     df = df.copy()
-    df['log_return'] = np.log(df['Close'] / df['Close'].shift(1))
-    df['Volatility'] = df['log_return'].rolling(vol_window).std() * np.sqrt(252) * 100
+    df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+    df["Volatility"] = df["log_return"].rolling(vol_window).std() * np.sqrt(252) * 100
+
+    # 1. RSI
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+    df["RSI"] = df["RSI"].fillna(50)
+
+    # 2. MACD (Added for fairness)
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+
+    # 3. BB Width (Added for fairness)
+    sma = df['Close'].rolling(window=20).mean()
+    std = df['Close'].rolling(window=20).std()
+    df['BB_Width'] = ((sma + std*2) - (sma - std*2)) / sma
+
     df = df.dropna().reset_index(drop=True)
-    volatility = df['Volatility'].values
 
-    # 2. Split
-    split_idx = int(len(volatility) * train_ratio)
-    train_vol = volatility[:split_idx]
-    test_vol = volatility[split_idx:]
+    # 5 Features
+    features = df[["Volatility", "RSI", "log_return", "MACD", "BB_Width"]].values
 
-    # 3. Centering (Global Mean Removal)
-    train_mean = train_vol.mean()
-    train_vol_centered = train_vol - train_mean
-    test_vol_centered = test_vol - train_mean
+    split_idx = int(len(features) * 0.8)
+    train_feat, test_feat = features[:split_idx], features[split_idx:]
 
-    # 4. Scaling
-    scaler = StandardScaler()
-    train_vol_scaled = scaler.fit_transform(train_vol_centered.reshape(-1, 1)).flatten()
-    test_vol_scaled = scaler.transform(test_vol_centered.reshape(-1, 1)).flatten()
+    train_feat_scaled = np.zeros_like(train_feat)
+    test_feat_scaled = np.zeros_like(test_feat)
+    target_scaler = None
 
-    # Prepare Datasets (for NNs)
-    train_dataset = SimpleVolatilityDataset(train_vol_scaled, window=lookback)
-    test_dataset = SimpleVolatilityDataset(test_vol_scaled, window=lookback)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    for i in range(features.shape[1]):
+        s = StandardScaler()
+        train_feat_scaled[:, i] = s.fit_transform(train_feat[:, i].reshape(-1, 1)).flatten()
+        test_feat_scaled[:, i] = s.transform(test_feat[:, i].reshape(-1, 1)).flatten()
+        if i == 0: target_scaler = s
 
-    results = {}
+    def create_sequences(data, lookback, horizon):
+        X, y = [], []
+        # X: [t-L : t]
+        # y: [t+H-1] (Future value)
+        for i in range(len(data) - lookback - horizon + 1):
+            X.append(data[i : i + lookback])
+            y.append(data[i + lookback + horizon - 1, 0])
+        return np.array(X), np.array(y)
 
-    # --- 1. Naive (Lag-1) ---
-    print("\n[1/5] Naive Model (Lag-1)")
-    naive = NaiveModel()
-    # Evaluate on Original Scale
-    metrics, _, _ = naive.evaluate(test_vol)
-    results['Naive (Lag-1)'] = {'metrics': metrics}
-    print(f"  RMSE: {metrics['rmse']:.4f} | Dir Acc: {metrics['direction_acc']:.4f}")
+    X_train, y_train = create_sequences(train_feat_scaled, lookback, horizon)
+    X_test, y_test = create_sequences(test_feat_scaled, lookback, horizon)
 
-    # --- 2. Moving Average ---
-    print("\n[2/5] Moving Average (w=5)")
-    ma = MovingAverageModel(window=5)
-    metrics, _, _ = ma.evaluate(test_vol)
-    results['Moving Average'] = {'metrics': metrics}
-    print(f"  RMSE: {metrics['rmse']:.4f} | Dir Acc: {metrics['direction_acc']:.4f}")
+    train_loader = DataLoader(VolatilityDataset(X_train, y_train), batch_size=32, shuffle=True)
+    test_loader = DataLoader(VolatilityDataset(X_test, y_test), batch_size=32, shuffle=False)
 
-    # --- 3. GARCH (EMA Proxy) ---
-    print("\n[3/5] GARCH/EMA")
-    garch = GARCHModel()
-    preds = garch.fit_predict(train_vol, test_vol)
-    # Align lengths
-    targets = test_vol
-    if len(preds) != len(targets):
-        min_len = min(len(preds), len(targets))
-        preds = preds[-min_len:]
-        targets = targets[-min_len:]
-    
+    return train_loader, test_loader, target_scaler, X_train, y_train, X_test, y_test
+
+# ==================== 2. Evaluation Logic ====================
+def evaluate_horizon_metrics(name, targets, preds, last_known_vals):
+    """
+    targets: 真實值 (at T+H)
+    preds: 預測值 (for T+H)
+    last_known_vals: T 時刻的值 (用來算方向)
+    """
+    # 1. R2 & RMSE
     rmse = np.sqrt(mean_squared_error(targets, preds))
-    mae = mean_absolute_error(targets, preds)
     r2 = r2_score(targets, preds)
-    dir_acc = np.mean(np.sign(np.diff(preds)) == np.sign(np.diff(targets)))
-    
-    results['GARCH(1,1)'] = {'metrics': {'rmse': rmse, 'mae': mae, 'r2': r2, 'direction_acc': dir_acc}}
-    print(f"  RMSE: {rmse:.4f} | Dir Acc: {dir_acc:.4f}")
 
-    # --- 4. Single GRU ---
-    print("\n[4/5] Single GRU (Training...)")
-    gru = SingleRNN('GRU').to(DEVICE)
-    gru = train_model(gru, train_loader, test_loader, num_epochs=50)
-    
-    preds_scaled, targets_scaled = get_preds(gru, test_loader, DEVICE)
-    # Inverse Transform
-    preds = scaler.inverse_transform(preds_scaled.reshape(-1,1)).flatten() + train_mean
-    targets = scaler.inverse_transform(targets_scaled.reshape(-1,1)).flatten() + train_mean
-    
-    rmse = np.sqrt(mean_squared_error(targets, preds))
-    mae = mean_absolute_error(targets, preds)
-    r2 = r2_score(targets, preds)
-    dir_acc = np.mean(np.sign(np.diff(preds)) == np.sign(np.diff(targets)))
-    
-    results['Single GRU'] = {'metrics': {'rmse': rmse, 'mae': mae, 'r2': r2, 'direction_acc': dir_acc}}
-    print(f"  RMSE: {rmse:.4f} | Dir Acc: {dir_acc:.4f}")
+    # 2. Directional Accuracy
+    # 真實變動: Target(T+H) - Known(T)
+    true_delta = targets - last_known_vals
+    pred_delta = preds - last_known_vals
 
-    # --- 5. Single LSTM ---
-    print("\n[5/5] Single LSTM (Training...)")
-    lstm = SingleRNN('LSTM').to(DEVICE)
-    lstm = train_model(lstm, train_loader, test_loader, num_epochs=50)
-    
-    preds_scaled, targets_scaled = get_preds(lstm, test_loader, DEVICE)
-    # Inverse Transform
-    preds = scaler.inverse_transform(preds_scaled.reshape(-1,1)).flatten() + train_mean
-    targets = scaler.inverse_transform(targets_scaled.reshape(-1,1)).flatten() + train_mean
-    
-    rmse = np.sqrt(mean_squared_error(targets, preds))
-    mae = mean_absolute_error(targets, preds)
-    r2 = r2_score(targets, preds)
-    dir_acc = np.mean(np.sign(np.diff(preds)) == np.sign(np.diff(targets)))
-    
-    results['Single LSTM'] = {'metrics': {'rmse': rmse, 'mae': mae, 'r2': r2, 'direction_acc': dir_acc}}
-    print(f"  RMSE: {rmse:.4f} | Dir Acc: {dir_acc:.4f}")
+    # 防止除以0或delta為0的情況
+    # 這裡如果不相等，且方向一致才算對
+    # 對 Naive 來說，pred_delta 永遠是 0，所以 sign 是 0
+    # 除非 true_delta 也是 0，否則 Naive 在這項會拿 0 分 (這很合理，因為它沒預測變動)
 
-    return results
+    dir_correct = (np.sign(true_delta) == np.sign(pred_delta))
 
-# ==================== Comparison & Plotting ====================
-def print_and_plot_results(results):
-    # Add Your MoE Results Manually
-    results['MODWT-MoE'] = {
-        'metrics': {
-            'rmse': 1.4256, 
-            'mae': 1.0333, 
-            'r2': 0.8396, 
-            'direction_acc': 0.5787
-        }
+    # 特別處理 Naive: 如果 Naive 預測不變，而市場真的沒變，算對；否則算錯
+    # 但通常市場都會變，所以 Naive 會死很慘
+
+    acc_overall = np.mean(dir_correct)
+
+    # 3. High Volatility Accuracy
+    magnitude = np.abs(true_delta)
+    threshold = np.percentile(magnitude, 80)
+    high_vol_mask = magnitude > threshold
+
+    if np.sum(high_vol_mask) > 0:
+        acc_high_vol = np.mean(dir_correct[high_vol_mask])
+    else:
+        acc_high_vol = 0.0
+
+    print(f"   > {name:<15} | RMSE: {rmse:.4f} | R2: {r2:.4f} | Dir: {acc_overall*100:.2f}% | Hi-Vol: {acc_high_vol*100:.2f}%")
+    return {
+        "Model": name,
+        "RMSE": rmse,
+        "R2": r2,
+        "Dir Acc": acc_overall,
+        "High Vol Acc": acc_high_vol
     }
 
-    # Create DataFrame
-    data = []
-    for name, res in results.items():
-        m = res['metrics']
-        data.append({
-            'Model': name,
-            'RMSE': m['rmse'],
-            'MAE': m['mae'],
-            'R2': m['r2'],
-            'Dir Acc': m['direction_acc']
-        })
-    df_res = pd.DataFrame(data).set_index('Model')
-    
-    # Sort by Dir Acc for display
-    df_res = df_res.sort_values('Dir Acc', ascending=True)
+# ==================== 3. Models ====================
 
-    print("\n" + "="*80)
-    print("FINAL COMPARISON TABLE")
-    print("="*80)
-    print(df_res)
-    
-    df_res.to_csv('../results/final_comparison.csv')
-    print("\nSaved to ../results/final_comparison.csv")
+# --- Naive ---
+def run_naive(y_test, X_test, scaler, horizon):
+    # Naive Logic: Pred[T+H] = Known[T]
+    # y_test is Actual[T+H]
+    # X_test[:, -1, 0] is Known[T] (Scaled)
 
-    # Plotting
-    models = df_res.index
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    # Helper to highlight MoE
-    colors = ['red' if 'MoE' in m else 'skyblue' for m in models]
+    targets = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    last_known = scaler.inverse_transform(X_test[:, -1, 0].reshape(-1, 1)).flatten()
 
-    # RMSE
-    axes[0,0].barh(models, df_res['RMSE'], color=colors, edgecolor='k')
-    axes[0,0].set_title('RMSE (Lower is Better)')
-    
-    # MAE
-    axes[0,1].barh(models, df_res['MAE'], color=colors, edgecolor='k')
-    axes[0,1].set_title('MAE (Lower is Better)')
-    
-    # R2
-    axes[1,0].barh(models, df_res['R2'], color=colors, edgecolor='k')
-    axes[1,0].set_title('R2 Score (Higher is Better)')
-    
-    # Dir Acc
-    axes[1,1].barh(models, df_res['Dir Acc'], color=colors, edgecolor='k')
-    axes[1,1].set_title('Direction Accuracy (Higher is Better)')
-    axes[1,1].axvline(0.5, color='gray', linestyle='--')
+    preds = last_known # Naive prediction
 
-    plt.tight_layout()
-    plt.savefig('../results/baseline_comparison_chart.png', dpi=300)
-    print("Chart saved to ../results/baseline_comparison_chart.png")
+    return evaluate_horizon_metrics(f"Naive (Lag-{horizon})", targets, preds, last_known)
+
+# --- XGBoost ---
+def run_xgboost(X_train, y_train, X_test, y_test, scaler):
+    X_train_flat = X_train.reshape(X_train.shape[0], -1)
+    X_test_flat = X_test.reshape(X_test.shape[0], -1)
+
+    model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6, n_jobs=-1, random_state=SEED)
+    model.fit(X_train_flat, y_train)
+    preds_scaled = model.predict(X_test_flat)
+
+    preds = scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
+    targets = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    last_known = scaler.inverse_transform(X_test[:, -1, 0].reshape(-1, 1)).flatten()
+
+    return evaluate_horizon_metrics("XGBoost", targets, preds, last_known)
+
+# --- LSTM ---
+class VanillaLSTM(nn.Module):
+    def __init__(self, input_size=5, hidden_size=64):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=2, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size, 1)
+    def forward(self, x):
+        out, (h_n, _) = self.lstm(x)
+        return self.fc(h_n[-1])
+
+def run_lstm(train_loader, test_loader, scaler):
+    model = VanillaLSTM(input_size=5).to(DEVICE) # Input size 5 for enhanced features
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    for epoch in range(30):
+        model.train()
+        for batch in train_loader:
+            x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE).unsqueeze(-1)
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    preds, targets, last_knowns = [], [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE)
+            out = model(x)
+            preds.append(out.cpu().numpy())
+            targets.append(y.cpu().numpy())
+            last_knowns.append(x[:, -1, 0].cpu().numpy()) # Capture last known vol
+
+    preds = scaler.inverse_transform(np.concatenate(preds).flatten().reshape(-1,1)).flatten()
+    targets = scaler.inverse_transform(np.concatenate(targets).flatten().reshape(-1,1)).flatten()
+    last_known = scaler.inverse_transform(np.concatenate(last_knowns).flatten().reshape(-1,1)).flatten()
+
+    return evaluate_horizon_metrics("Vanilla LSTM", targets, preds, last_known)
 
 # ==================== Main ====================
 if __name__ == "__main__":
-    os.makedirs('../results', exist_ok=True)
-    
-    # Load Data
-    try:
-        df = pd.read_csv("../dataset/USD_TWD.csv")
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.sort_values("Date").reset_index(drop=True)
-        print(f"Loaded {len(df)} rows.")
-        
-        # Run Evaluation
-        results = evaluate_all_baselines(df)
-        
-        # Print & Plot
-        print_and_plot_results(results)
-        
-    except FileNotFoundError:
-        print("Error: ../dataset/USD_TWD.csv not found.")
+
+    # Load and Prepare Data
+    df = pd.read_csv(dataset_path)
+    train_loader, test_loader, scaler, X_train, y_train, X_test, y_test = prepare_data_fair(df, horizon=HORIZON)
+
+    results = []
+    print(f"\n[Running Baselines for Horizon={HORIZON}]...")
+
+    # 1. Naive
+    results.append(run_naive(y_test, X_test, scaler, HORIZON))
+
+    # 2. XGBoost
+    results.append(run_xgboost(X_train, y_train, X_test, y_test, scaler))
+
+    # 3. LSTM
+    results.append(run_lstm(train_loader, test_loader, scaler))
+
+    # =======================================================
+    # ★★★ 填入你的 V2 模型數據 (從 new_main_v2.py 跑出來的) ★★★
+    # =======================================================
+    results.append({
+        "Model": "E2E-FAR-MoE (V2)",
+        "RMSE": 2.9285,       # <-- 填入你的 V2 RMSE
+        "R2": 0.5618,         # <-- 填入你的 V2 R2
+        "Dir Acc": 0.6690,    # <-- 填入你的 V2 Dir Acc
+        "High Vol Acc": 0.8007 # <-- 填入你的 V2 High Vol Acc
+    })
+
+    # Print Table
+    df_res = pd.DataFrame(results)
+    print("\n" + "="*80)
+    print(f"🏆 HORIZON={HORIZON} FINAL SHOWDOWN")
+    print("="*80)
+    print(df_res.to_string(index=False, float_format="%.4f"))
+
+    # Plot
+    metrics = ['R2', 'High Vol Acc']
+    ax = df_res.set_index('Model')[metrics].plot(kind='bar', figsize=(10, 6), rot=45,
+                                                 color=['#A0A0A0', '#845EC2'], edgecolor='black')
+    plt.title(f"Horizon={HORIZON}: R2 vs High Volatility Accuracy")
+    plt.axhline(0, color='black', linewidth=0.8)
+    plt.tight_layout()
+    plt.savefig(save_path / "final_benchmark_horizon3.png")
+    print("\n✓ Comparison plot saved.")
