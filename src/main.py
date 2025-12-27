@@ -1,14 +1,9 @@
 """
-V11 E2E Challenge: Deep Learning (Raw) vs XGBoost (Raw vs Full)
+V11 Final Showdown: DLinear vs. DLinear+CNN
 ===============================================================
-Hypothesis:
-1. V11 (Raw) > XGBoost (Raw) -> Proves CNN architecture value (Feature Extraction).
-2. V11 (Raw) ~ XGBoost (Full) -> The "Holy Grail". Proves E2E learning capability.
-
-Structure:
-- Model: V11 Hybrid CNN-MoE + Learnable Decomp + Wide
-- Input: ONLY Volatility & Log_Return (2 channels)
-- Comparison: XGBoost (Raw) and XGBoost (MACD/RSI/etc.)
+Objective:
+Directly compare metrics to see if adding CNN improves performance
+over the standard DLinear baseline.
 """
 
 import os
@@ -21,7 +16,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score
 from pathlib import Path
 import warnings
-import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 warnings.filterwarnings("ignore")
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -34,7 +30,7 @@ if not save_path.exists():
 
 # ==================== Configuration ====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = 5827
+SEED = 42
 HORIZON = 3
 LOOKBACK = 30
 
@@ -45,7 +41,7 @@ if torch.cuda.is_available():
 
 print(f"[Setup] Device: {DEVICE} | Seed: {SEED} | Horizon: {HORIZON}")
 
-# ==================== 1. V11 Architecture (Raw Input Version) ====================
+# ==================== 1. Components & Model ====================
 class LearnableMovingAvg(nn.Module):
     def __init__(self, kernel_size, input_channels):
         super(LearnableMovingAvg, self).__init__()
@@ -82,7 +78,7 @@ class CNNExpert(nn.Module):
             nn.Conv1d(input_channels, hidden_dim, kernel_size=3, padding=1),
             nn.BatchNorm1d(hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Dropout(0.2),
+            nn.Dropout(0.2), # 稍微增加一點 Dropout 防止過擬合
             nn.Conv1d(hidden_dim, hidden_dim * 2, kernel_size=3, padding=1),
             nn.BatchNorm1d(hidden_dim * 2),
             nn.LeakyReLU(0.1),
@@ -98,72 +94,59 @@ class CNNExpert(nn.Module):
         out = self.fc(feat)
         return out
 
-class WideLayer(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.linear = nn.Linear(input_dim, 1)
-    def forward(self, x_last):
-        return self.linear(x_last)
-
-class HybridCNNMoE(nn.Module):
-    def __init__(self, seq_len=30, pred_len=1, input_channels=2): # Input=2 (Raw Only)
+class EnhancedDLinear(nn.Module):
+    def __init__(self, seq_len=30, pred_len=1, input_channels=2):
         super().__init__()
 
+        # 1. Decomposition
         self.decomp = SeriesDecomp(kernel_size=15, input_channels=input_channels)
 
-        self.expert_trend_1 = CNNExpert(seq_len, pred_len, input_channels)
-        self.expert_trend_2 = CNNExpert(seq_len, pred_len, input_channels)
-        self.expert_cyclic_1 = CNNExpert(seq_len, pred_len, input_channels)
-        self.expert_cyclic_2 = CNNExpert(seq_len, pred_len, input_channels)
+        # 2. Linear Backbone (DLinear)
+        self.linear_trend = nn.Linear(seq_len * input_channels, pred_len)
+        self.linear_seasonal = nn.Linear(seq_len * input_channels, pred_len)
 
-        self.base_linear = nn.Linear(seq_len * input_channels, pred_len)
-        self.wide = WideLayer(input_channels)
+        # 3. CNN Booster
+        self.cnn_trend = CNNExpert(seq_len, pred_len, input_channels, hidden_dim=32)
+        self.cnn_seasonal = CNNExpert(seq_len, pred_len, input_channels, hidden_dim=32)
 
-        self.gating_trend = nn.Sequential(nn.Linear(input_channels * 3, 64), nn.LeakyReLU(0.1), nn.Linear(64, 2))
-        self.gating_cyclic = nn.Sequential(nn.Linear(input_channels * 3, 64), nn.LeakyReLU(0.1), nn.Linear(64, 2))
-        self.meta_gate = nn.Sequential(nn.Linear(input_channels * 3, 32), nn.LeakyReLU(0.1), nn.Linear(32, 1))
-        nn.init.constant_(self.meta_gate[-1].bias, -0.5)
+        # 4. Static Weights (Learnable Scalars)
+        # 給予一點點初始偏置，讓它容易學到負值 (阻尼)
+        self.trend_gate = nn.Parameter(torch.tensor(-0.01))
+        self.seasonal_gate = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, x):
         seasonal_part, trend_part = self.decomp(x)
         B, S, C = x.shape
 
-        base_delta = self.base_linear(x.reshape(B, -1))
-        wide_delta = self.wide(x[:, -1, :])
+        trend_flat = trend_part.reshape(B, -1)
+        seasonal_flat = seasonal_part.reshape(B, -1)
 
-        t1 = self.expert_trend_1(trend_part)
-        t2 = self.expert_trend_2(trend_part)
-        c1 = self.expert_cyclic_1(seasonal_part)
-        c2 = self.expert_cyclic_2(seasonal_part)
+        # Linear Parts
+        trend_out_linear = self.linear_trend(trend_flat)
+        seasonal_out_linear = self.linear_seasonal(seasonal_flat)
 
-        ctx_mean = x.mean(dim=1)
-        ctx_std = x.std(dim=1)
-        ctx_last = x[:, -1, :]
-        context = torch.cat([ctx_mean, ctx_std, ctx_last], dim=1)
+        # CNN Parts
+        trend_out_cnn = self.cnn_trend(trend_part)
+        seasonal_out_cnn = self.cnn_seasonal(seasonal_part)
 
-        w_trend = torch.softmax(self.gating_trend(context), dim=1)
-        w_cyclic = torch.softmax(self.gating_cyclic(context), dim=1)
+        # Fusion
+        trend_final = trend_out_linear + (torch.tanh(self.trend_gate) * trend_out_cnn)
+        seasonal_final = seasonal_out_linear + (torch.tanh(self.seasonal_gate) * seasonal_out_cnn)
 
-        trend_final = (w_trend[:, 0:1] * t1) + (w_trend[:, 1:2] * t2)
-        cyclic_final = (w_cyclic[:, 0:1] * c1) + (w_cyclic[:, 1:2] * c2)
+        output = x[:, -1, 0:1] + trend_final + seasonal_final
 
-        moe_delta = trend_final + cyclic_final
-        alpha = torch.sigmoid(self.meta_gate(context))
-
-        total_delta = base_delta + wide_delta + (alpha * moe_delta)
-        output = x[:, -1, 0:1] + total_delta
-        aux_output = x[:, -1, 0:1] + base_delta + wide_delta
-
-        return output, aux_output
+        # Return weights for logging
+        return output, None, torch.stack([self.trend_gate, self.seasonal_gate])
 
 class HybridDirectionalLoss(nn.Module):
-    def __init__(self, direction_weight=0.5):
+    def __init__(self, direction_weight=0.5, delta=10.0):
         super().__init__()
         self.mse = nn.MSELoss()
+        self.huber = nn.HuberLoss(delta=delta)
         self.dir_weight = direction_weight
 
     def forward(self, pred, target, prev_value):
-        loss_val = self.mse(pred, target)
+        loss_val = self.huber(pred, target)
         true_delta = target - prev_value
         pred_delta = pred - prev_value
         sign_agreement = torch.tanh(true_delta * 10) * torch.tanh(pred_delta * 10)
@@ -178,46 +161,17 @@ class VolatilityDataset(Dataset):
     def __getitem__(self, idx): return {"raw_input": self.X[idx], "target": self.y[idx]}
 
 # ==================== 2. Data Preparation ====================
-# ==================== 2. Data Preparation (Fixed Alignment) ====================
 def prepare_data(df, lookback=30, horizon=3, mode='raw'):
-    """
-    Unified Data Prep: Always calculate FULL features first to ensure alignment,
-    then select columns based on mode.
-    """
     df = df.copy()
     vol_window = 7
 
-    # 1. Always calculate ALL features first (to ensure same dropna behavior)
     df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
     df["Volatility"] = df["log_return"].rolling(vol_window).std() * np.sqrt(252) * 100
-
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df["RSI"] = df["RSI"].fillna(50)
-
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-
-    sma = df['Close'].rolling(window=20).mean()
-    std = df['Close'].rolling(window=20).std()
-    df['BB_Width'] = ((sma + std*2) - (sma - std*2)) / sma
-
-    # 2. Drop NA (This aligns the rows for both modes)
     df = df.dropna().reset_index(drop=True)
 
-    # 3. Select Columns based on Mode
-    if mode == 'full':
-        feature_cols = ["Volatility", "RSI", "log_return", "MACD", "BB_Width"]
-    else: # mode == 'raw'
-        feature_cols = ["Volatility", "log_return"]
-
+    feature_cols = ["Volatility", "log_return"]
     features = df[feature_cols].values
 
-    # 4. Split & Scale
     split_idx = int(len(features) * 0.8)
     train_feat, test_feat = features[:split_idx], features[split_idx:]
 
@@ -241,142 +195,147 @@ def prepare_data(df, lookback=30, horizon=3, mode='raw'):
     X_train, y_train = create_sequences(train_feat_scaled, lookback, horizon)
     X_test, y_test = create_sequences(test_feat_scaled, lookback, horizon)
 
-    # 5. Return
-    if mode == 'raw':
-        # Create Loaders only for Raw mode (Deep Learning)
-        train_loader = DataLoader(VolatilityDataset(X_train, y_train), batch_size=32, shuffle=True)
-        test_loader = DataLoader(VolatilityDataset(X_test, y_test), batch_size=32, shuffle=False)
-        return train_loader, test_loader, scalers, X_train, y_train, X_test, y_test
-    else:
-        # For XGBoost Full, we just need the numpy arrays
-        return None, None, scalers, X_train, y_train, X_test, y_test
+    train_loader = DataLoader(VolatilityDataset(X_train, y_train), batch_size=32, shuffle=True)
+    test_loader = DataLoader(VolatilityDataset(X_test, y_test), batch_size=32, shuffle=False)
 
-# ==================== 3. Training & Evaluation Functions ====================
+    return train_loader, test_loader, scalers, X_train, y_train, X_test, y_test
+
+# ==================== 3. Training Function ====================
 def train_v11(train_loader, test_loader, num_epochs=120, lr=0.001):
-    model = HybridCNNMoE(seq_len=30, pred_len=1, input_channels=2).to(DEVICE)
+    model = EnhancedDLinear(seq_len=30, pred_len=1, input_channels=2).to(DEVICE)
     criterion = HybridDirectionalLoss(direction_weight=0.5)
-    mse = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
-    print("\n[Training] V11 (Raw Data)...")
+    print("\n[Training] V11 (Enhanced DLinear)...")
     for epoch in range(num_epochs):
         model.train()
         losses = []
-        aux_weight = max(0.1, 1.0 - (epoch / (num_epochs * 0.8)))
-
         for batch in train_loader:
             x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE).unsqueeze(-1)
             optimizer.zero_grad()
             prev_val = x[:, -1, 0:1]
-            out, aux_out = model(x)
-            loss = criterion(out, y, prev_val) + (aux_weight * mse(aux_out, y))
+            out, _, _ = model(x)
+            loss = criterion(out, y, prev_val)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
 
         scheduler.step()
-        if (epoch+1) % 40 == 0:
-            print(f"  Epoch {epoch+1} | Loss: {np.mean(losses):.4f}")
+
+        if (epoch+1) % 20 == 0:
+            tr_w = torch.tanh(model.trend_gate).item()
+            se_w = torch.tanh(model.seasonal_gate).item()
+            print(f"  Epoch {epoch+1} | Loss: {np.mean(losses):.4f} | Trend W: {tr_w:.3f} | Seas W: {se_w:.3f}")
 
     return model
 
-def run_xgboost(X_train, y_train, X_test, y_test, scaler):
-    # Flatten for XGBoost
-    X_train_flat = X_train.reshape(X_train.shape[0], -1)
-    X_test_flat = X_test.reshape(X_test.shape[0], -1)
-
-    model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=6, n_jobs=-1, random_state=SEED)
-    model.fit(X_train_flat, y_train)
-    preds_scaled = model.predict(X_test_flat)
-    return scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
-
 def get_metrics(targets, preds, last_knowns):
-    rmse = np.sqrt(mean_squared_error(targets, preds))
     r2 = r2_score(targets, preds)
+    rmse = np.sqrt(mean_squared_error(targets, preds))
+
     true_delta = targets - last_knowns
     pred_delta = preds - last_knowns
     dir_correct = (np.sign(true_delta) == np.sign(pred_delta))
     acc = np.mean(dir_correct)
+
     magnitude = np.abs(true_delta)
     thresh = np.percentile(magnitude, 80)
     high_vol_mask = magnitude > thresh
     acc_high = np.mean(dir_correct[high_vol_mask]) if np.sum(high_vol_mask)>0 else 0
-    return r2, acc_high, acc
+    return r2, rmse, acc, acc_high
 
 # ==================== Main Execution ====================
 if __name__ == "__main__":
     df = pd.read_csv(dataset_path)
 
-    # -------------------------------------------------------
-    # 1. Prepare Data for V11 & XGBoost (Raw)
-    # -------------------------------------------------------
-    train_loader, test_loader, scalers_raw, X_train_raw, y_train_raw, X_test_raw, y_test_raw = \
-        prepare_data(df, lookback=LOOKBACK, horizon=HORIZON, mode='raw')
+    # 1. Prepare Data
+    train_loader, test_loader, scalers_raw, _, _, _, _ = prepare_data(df, lookback=LOOKBACK, horizon=HORIZON, mode='raw')
 
-    # -------------------------------------------------------
-    # 2. Train V11 (Raw)
-    # -------------------------------------------------------
+    # 2. Train Model
     model = train_v11(train_loader, test_loader)
 
-    # Evaluate V11 with Nuclear Fix
+    # 3. Side-by-Side Evaluation (The Truth!)
     model.eval()
-    preds_v11, targets_v11, last_knowns_v11 = [], [], []
+
+    # Lists for metrics
+    preds_dlinear = []
+    preds_hybrid = []
+    targets_all = []
+    last_knowns_all = []
+
+    trend_w = torch.tanh(model.trend_gate).item()
+    seas_w = torch.tanh(model.seasonal_gate).item()
+
     with torch.no_grad():
         for batch in test_loader:
             x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE)
-            out, _ = model(x)
-            p, t, l = out.detach().cpu().numpy(), y.cpu().numpy(), x[:, -1, 0].cpu().numpy()
+            B = x.shape[0]
 
-            bs = x.shape[0]
-            if p.ndim > 2: p = p[:, :, 0]
-            preds_v11.append(p.flatten()[:bs].reshape(bs, 1))
-            targets_v11.append(t.flatten()[:bs].reshape(bs, 1))
-            last_knowns_v11.append(l.flatten()[:bs].reshape(bs, 1))
+            # Re-run Forward Pass logic manually to separate components
+            seasonal_part, trend_part = model.decomp(x)
 
-    preds_v11 = scalers_raw['target'].inverse_transform(np.concatenate(preds_v11, axis=0)).flatten()
-    targets_v11 = scalers_raw['target'].inverse_transform(np.concatenate(targets_v11, axis=0)).flatten()
-    last_knowns_v11 = scalers_raw['target'].inverse_transform(np.concatenate(last_knowns_v11, axis=0)).flatten()
+            # Linear Parts
+            trend_out_linear = model.linear_trend(trend_part.reshape(B, -1))
+            seasonal_out_linear = model.linear_seasonal(seasonal_part.reshape(B, -1))
 
-    r2_v11, h_acc_v11, acc_v11 = get_metrics(targets_v11, preds_v11, last_knowns_v11)
+            # CNN Parts
+            trend_out_cnn = model.cnn_trend(trend_part)
+            seasonal_out_cnn = model.cnn_seasonal(seasonal_part)
 
-    # -------------------------------------------------------
-    # 3. XGBoost Baseline (Raw Data)
-    # -------------------------------------------------------
-    print("\n[Baseline] Running XGBoost (Raw Data)...")
-    preds_xgb_raw = run_xgboost(X_train_raw, y_train_raw, X_test_raw, y_test_raw, scalers_raw['target'])
-    r2_xgb_raw, h_acc_xgb_raw, acc_xgb_raw = get_metrics(targets_v11, preds_xgb_raw, last_knowns_v11)
+            # Base Value (Last Input)
+            last_val = x[:, -1, 0:1]
 
-    # -------------------------------------------------------
-    # 4. XGBoost Baseline (Full Features: MACD, RSI...)
-    # -------------------------------------------------------
-    print("[Baseline] Running XGBoost (Full Features: MACD, RSI...)...")
-    _, _, scalers_full, X_train_full, y_train_full, X_test_full, y_test_full = \
-        prepare_data(df, lookback=LOOKBACK, horizon=HORIZON, mode='full')
+            # --- Prediction A: Pure DLinear (Assume Weights=0) ---
+            pred_base = last_val + trend_out_linear + seasonal_out_linear
 
-    preds_xgb_full = run_xgboost(X_train_full, y_train_full, X_test_full, y_test_full, scalers_full['target'])
-    r2_xgb_full, h_acc_xgb_full, acc_xgb_full = get_metrics(targets_v11, preds_xgb_full, last_knowns_v11)
+            # --- Prediction B: Hybrid (Base + Weighted CNN) ---
+            correction = (trend_w * trend_out_cnn) + (seas_w * seasonal_out_cnn)
+            pred_full = pred_base + correction
 
-    # -------------------------------------------------------
-    # 5. Final Report
-    # -------------------------------------------------------
-    print("\n" + "="*75)
-    print(f"📊 FINAL SHOWDOWN: V11 (Deep Learning) vs XGBoost (Machine Learning)")
-    print("="*75)
-    print(f"{'Model':<20} | {'Inputs':<15} | {'R2 Score':<10} | {'High Vol Acc':<12} | {'Dir Acc':<10}")
-    print("-" * 75)
-    print(f"{'XGBoost (Weak)':<20} | {'Raw Only':<15} | {r2_xgb_raw:<10.4f} | {h_acc_xgb_raw:<12.4f} | {acc_xgb_raw:<10.4f}")
-    print(f"{'XGBoost (Strong)':<20} | {'Full Feats':<15} | {r2_xgb_full:<10.4f} | {h_acc_xgb_full:<12.4f} | {acc_xgb_full:<10.4f}")
-    print("-" * 75)
-    print(f"{'V11 CNN-MoE':<20} | {'Raw Only':<15} | {r2_v11:<10.4f} | {h_acc_v11:<12.4f} | {acc_v11:<10.4f}")
-    print("="*75)
+            # Store Scaled Results
+            preds_dlinear.append(pred_base.cpu().numpy().flatten())
+            preds_hybrid.append(pred_full.cpu().numpy().flatten())
+            targets_all.append(y.cpu().numpy().flatten())
+            last_knowns_all.append(last_val.cpu().numpy().flatten())
 
-    if r2_v11 > r2_xgb_raw:
-        print("✅ CONCLUSION: V11 beats XGBoost (Raw). Deep Learning successfully extracts features!")
-    else:
-        print("⚠️ CONCLUSION: V11 needs more tuning to beat XGBoost (Raw).")
+    # 4. Inverse Transform & Metrics
+    scaler = scalers_raw['target']
 
-    if r2_v11 > r2_xgb_full:
-        print("🏆 HOLY GRAIL: V11 (Raw) beats XGBoost (Full). E2E Learning is Superior!")
-    elif r2_v11 > (r2_xgb_full - 0.02):
-        print("🥈 EXCELLENT: V11 (Raw) is competitive with XGBoost (Full). Feature Engineering is automated.")
+    # Helper to inverse and flatten
+    def inv(data):
+        return scaler.inverse_transform(np.concatenate(data).reshape(-1, 1)).flatten()
+
+    y_true = inv(targets_all)
+    y_last = inv(last_knowns_all)
+    y_dlinear = inv(preds_dlinear)
+    y_hybrid = inv(preds_hybrid)
+
+    # Calculate Metrics
+    r2_base, rmse_base, acc_base, h_acc_base = get_metrics(y_true, y_dlinear, y_last)
+    r2_full, rmse_full, acc_full, h_acc_full = get_metrics(y_true, y_hybrid, y_last)
+
+    # 5. Print Comparison Table
+    print("\n" + "="*85)
+    print(f"🥊 HEAD-TO-HEAD: Pure DLinear vs. DLinear + CNN")
+    print(f"   (Weights -> Trend: {trend_w:.4f} | Seasonal: {seas_w:.4f})")
+    print("="*85)
+    print(f"{'Metric':<15} | {'Pure DLinear':<15} | {'DLinear + CNN':<15} | {'Improvement':<15}")
+    print("-" * 85)
+
+    # R2 Score
+    diff_r2 = r2_full - r2_base
+    print(f"{'R2 Score':<15} | {r2_base:<15.4f} | {r2_full:<15.4f} | {diff_r2:+.4f} {'✅' if diff_r2>0 else '❌'}")
+
+    # RMSE
+    diff_rmse = rmse_full - rmse_base
+    print(f"{'RMSE (Lower=Better)':<15} | {rmse_base:<15.4f} | {rmse_full:<15.4f} | {diff_rmse:+.4f} {'✅' if diff_rmse<0 else '❌'}")
+
+    # Direction Accuracy
+    diff_acc = acc_full - acc_base
+    print(f"{'Direction Acc':<15} | {acc_base:<15.4f} | {acc_full:<15.4f} | {diff_acc:+.4f} {'✅' if diff_acc>0 else '❌'}")
+
+    # High Volatility Accuracy
+    diff_h_acc = h_acc_full - h_acc_base
+    print(f"{'High Vol Acc':<15} | {h_acc_base:<15.4f} | {h_acc_full:<15.4f} | {diff_h_acc:+.4f} {'✅' if diff_h_acc>0 else '❌'}")
+    print("="*85)
