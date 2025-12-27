@@ -22,7 +22,7 @@ import seaborn as sns
 warnings.filterwarnings("ignore")
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-dataset_path = BASE_DIR / "dataset" / "GBP_TWD.csv"
+dataset_path = BASE_DIR / "dataset" / "USD_TWD.csv"
 save_path = BASE_DIR / "results" / "horizon_3_e2e_challenge"
 
 if not save_path.exists():
