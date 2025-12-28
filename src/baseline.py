@@ -1,14 +1,8 @@
 """
-The ALL-STAR Arena: E2E-ALR vs. The World (10 Models)
-====================================================================
-Objective: Benchmark E2E-ALR against Stats, ML, and DL models.
-Sorting:   Ranked by R2 Score (Best to Worst).
-
-Competitors:
-[Stats] Naive, SMA, Linear Regression
-[ML]    SVR, Random Forest, XGBoost, LightGBM (Full Features)
-[DL]    LSTM, Transformer
-[Ours]  E2E-ALR Framework
+The ALL-STAR Arena: E2E-ALR vs. The World (Sequence Version - Detailed Breakdown)
+=================================================================================
+Objective: Benchmark E2E-ALR against Stats, ML, and DL models on 3-day sequences.
+Sorting:   Ranked by R2 Score.
 """
 
 import numpy as np
@@ -16,15 +10,13 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 import xgboost as xgb
-import lightgbm as lgb
 from pathlib import Path
 import warnings
 
@@ -34,23 +26,29 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # ==============================================================================
-# 🔴 請在此填入您 E2E-ALR Framework (V11) 的最佳成績
+# 🔴 請在此填入您 E2E-ALR Framework (V11) 的詳細成績
+# (參考您剛剛跑出來的 "Direction Accuracy (Win Rate)" 表格)
 # ==============================================================================
 MY_MODEL_NAME = "E2E-ALR (Ours)"
-MY_R2         = 0.6594  # 您提供的數據
-MY_RMSE       = 2.0784
-MY_ACC        = 0.7262
-MY_H_ACC      = 0.8973
+
+# 這裡填入您剛剛跑出的數值
+MY_R2         = 0.7868
+MY_RMSE       = 1.6442
+MY_AVG_ACC    = 0.7242  # Average (All Days)
+MY_DAY1_ACC   = 0.7186  # Day 1
+MY_DAY2_ACC   = 0.7209  # Day 2
+MY_DAY3_ACC   = 0.7331  # Day 3
+MY_H_ACC      = 0.8758  # High Volatility Acc
 # ==============================================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-dataset_path = BASE_DIR / "dataset" / "GBP_TWD.csv"
+dataset_path = BASE_DIR / "dataset" / "USD_TWD.csv"
 LOOKBACK = 30
 HORIZON = 3
 
 # ==================== DL Models Definitions ====================
 class LSTMModel(nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=64, num_layers=2, output_dim=1):
+    def __init__(self, input_dim=2, hidden_dim=64, num_layers=2, output_dim=HORIZON):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=0.2)
         self.fc = nn.Linear(hidden_dim, output_dim)
@@ -59,7 +57,7 @@ class LSTMModel(nn.Module):
         return self.fc(out[:, -1, :])
 
 class SimpleTransformer(nn.Module):
-    def __init__(self, input_dim=2, d_model=32, nhead=2, num_layers=1, output_dim=1):
+    def __init__(self, input_dim=2, d_model=32, nhead=2, num_layers=1, output_dim=HORIZON):
         super(SimpleTransformer, self).__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=64, dropout=0.1, batch_first=True)
@@ -83,7 +81,7 @@ def train_dl_model(model, X_train, y_train, epochs=60, lr=0.001):
             bx, by = bx.to(DEVICE), by.to(DEVICE)
             optimizer.zero_grad()
             out = model(bx)
-            loss = criterion(out, by.unsqueeze(-1))
+            loss = criterion(out, by)
             loss.backward()
             optimizer.step()
     return model
@@ -93,7 +91,7 @@ def predict_dl(model, X_test):
     with torch.no_grad():
         inputs = torch.FloatTensor(X_test).to(DEVICE)
         preds = model(inputs)
-    return preds.cpu().numpy().flatten()
+    return preds.cpu().numpy()
 
 def prepare_data_comparison(df):
     df = df.copy()
@@ -101,7 +99,7 @@ def prepare_data_comparison(df):
     df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
     df["Volatility"] = df["log_return"].rolling(vol_window).std() * np.sqrt(252) * 100
 
-    # 技術指標 (給 ML 模型作弊用)
+    # 技術指標
     df["RSI"] = df["log_return"].rolling(14).mean().fillna(0)
     exp1 = df['Close'].ewm(span=12).mean()
     exp2 = df['Close'].ewm(span=26).mean()
@@ -112,13 +110,11 @@ def prepare_data_comparison(df):
 
     df = df.dropna().reset_index(drop=True)
 
-    # 定義特徵集
     raw_cols = ["Volatility", "log_return"]
     full_cols = ["Volatility", "log_return", "RSI", "MACD", "BB_Width"]
 
     split_idx = int(len(df) * 0.8)
 
-    # Scaling
     scaler_raw = StandardScaler()
     data_raw = scaler_raw.fit_transform(df[raw_cols].values)
 
@@ -128,149 +124,153 @@ def prepare_data_comparison(df):
     target_scaler = StandardScaler()
     target_scaler.fit(df["Volatility"].values[:split_idx].reshape(-1, 1))
 
-    # Helper Sequence
     def create_seq(data, label_data):
         X, y = [], []
         for i in range(len(data) - LOOKBACK - HORIZON + 1):
             X.append(data[i:i+LOOKBACK])
-            y.append(label_data[i+LOOKBACK+HORIZON-1])
+            y.append(label_data[i+LOOKBACK : i+LOOKBACK+HORIZON])
         return np.array(X), np.array(y)
 
-    y_labels = data_raw[:, 0] # Volatility is always col 0
+    y_labels = data_raw[:, 0]
 
-    # Raw Data (For DL, Linear, Stats)
     X_raw, y_all = create_seq(data_raw, y_labels)
     X_tr_r, X_te_r = X_raw[:split_idx], X_raw[split_idx:]
     y_tr, y_te = y_all[:split_idx], y_all[split_idx:]
 
-    # Full Data (For ML)
     X_full, _ = create_seq(data_full, y_labels)
     X_tr_f, X_te_f = X_full[:split_idx], X_full[split_idx:]
 
     return (X_tr_r, X_te_r), (X_tr_f, X_te_f), y_tr, y_te, target_scaler
 
-def get_metrics(targets, preds, last_knowns):
-    r2 = r2_score(targets, preds)
-    rmse = np.sqrt(mean_squared_error(targets, preds))
+def get_metrics_detailed(targets, preds, last_knowns):
+    # targets, preds: (N, 3)
+    # last_knowns: (N, 1)
 
-    # Direction Accuracy
-    # Note: For Naive, preds == last_knowns, so sign(0) is 0.
-    # Accuracy will be 0. This is mathematically correct (Persistence predicts no change).
-    dir_correct = (np.sign(targets - last_knowns) == np.sign(preds - last_knowns))
-    acc = np.mean(dir_correct)
+    if last_knowns.ndim == 1:
+        last_knowns = last_knowns.reshape(-1, 1)
 
-    # High Vol Acc
-    mag = np.abs(targets - last_knowns)
-    thresh = np.percentile(mag, 80)
-    high_vol_mask = mag > thresh
+    # R2 & RMSE
+    r2 = r2_score(targets.flatten(), preds.flatten())
+    rmse = np.sqrt(mean_squared_error(targets.flatten(), preds.flatten()))
+
+    # Direction Accuracy Matrix
+    true_delta = targets - last_knowns
+    pred_delta = preds - last_knowns
+    dir_correct = (np.sign(true_delta) == np.sign(pred_delta)) # (N, 3) boolean
+
+    # 1. Average Acc
+    acc_avg = np.mean(dir_correct)
+
+    # 2. Step-wise Acc (Day 1, Day 2, Day 3)
+    acc_steps = np.mean(dir_correct, axis=0) # [acc_d1, acc_d2, acc_d3]
+
+    # 3. High Vol Acc
+    magnitude = np.abs(true_delta)
+    thresh = np.percentile(magnitude, 80)
+    high_vol_mask = magnitude > thresh
     h_acc = np.mean(dir_correct[high_vol_mask]) if np.sum(high_vol_mask)>0 else 0
 
-    return r2, rmse, acc, h_acc
+    return r2, rmse, acc_avg, acc_steps, h_acc
 
 # ==================== Main ====================
 if __name__ == "__main__":
-    print("🚀 Initiating ALL-STAR Benchmark Arena...")
+    print(f"🚀 Initiating ALL-STAR Benchmark Arena (Horizon={HORIZON})...")
     df = pd.read_csv(dataset_path)
     (X_tr_r, X_te_r), (X_tr_f, X_te_f), y_tr, y_te, scaler = prepare_data_comparison(df)
 
-    # Flatten Inputs for ML models
     X_tr_r_flat = X_tr_r.reshape(X_tr_r.shape[0], -1)
     X_te_r_flat = X_te_r.reshape(X_te_r.shape[0], -1)
     X_tr_f_flat = X_tr_f.reshape(X_tr_f.shape[0], -1)
     X_te_f_flat = X_te_f.reshape(X_te_f.shape[0], -1)
 
-    def inv(d): return scaler.inverse_transform(d.reshape(-1, 1)).flatten()
-    y_true = inv(y_te)
-    last_known = inv(X_te_r[:, -1, 0])
+    def inv_seq(d):
+        N, H = d.shape
+        flat = d.reshape(-1, 1)
+        inv_flat = scaler.inverse_transform(flat)
+        return inv_flat.reshape(N, H)
+
+    def inv_anchor(d):
+        return scaler.inverse_transform(d.reshape(-1, 1))
+
+    y_true = inv_seq(y_te)
+    last_known = inv_anchor(X_te_r[:, -1, 0])
 
     results = []
 
     # --- 1. Statistical Baselines ---
-    print("Running Stats Models (Naive, SMA, Linear)...")
+    print("Running Stats Models...")
+
     # Naive
-    metrics = get_metrics(y_true, last_known, last_known)
-    results.append(["Naive (Persistence)", "Stats", *metrics])
+    y_naive = np.repeat(last_known, HORIZON, axis=1)
+    metrics = get_metrics_detailed(y_true, y_naive, last_known)
+    # unpack: r2, rmse, avg, steps, high
+    results.append(["Naive", "Stats", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
     # SMA
-    sma = np.mean(X_te_r[:, :, 0], axis=1)
-    metrics = get_metrics(y_true, inv(sma), last_known)
-    results.append(["SMA (Moving Avg)", "Stats", *metrics])
+    sma = np.mean(X_te_r[:, :, 0], axis=1).reshape(-1, 1)
+    sma_seq = np.repeat(scaler.inverse_transform(sma), HORIZON, axis=1)
+    metrics = get_metrics_detailed(y_true, sma_seq, last_known)
+    results.append(["SMA", "Stats", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
     # Linear Regression
     lr = LinearRegression()
     lr.fit(X_tr_r_flat, y_tr)
-    y_pred = inv(lr.predict(X_te_r_flat))
-    metrics = get_metrics(y_true, y_pred, last_known)
-    results.append(["Linear Regression", "Stats", *metrics])
+    y_pred = inv_seq(lr.predict(X_te_r_flat))
+    metrics = get_metrics_detailed(y_true, y_pred, last_known)
+    results.append(["Linear Reg", "Stats", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
-    # --- 2. Machine Learning (Full Features) ---
-    print("Running ML Models (XGB, LGBM, RF, SVR)...")
+    # --- 2. Machine Learning ---
+    print("Running ML Models...")
 
     # SVR
-    svr = SVR(kernel='rbf', C=100, gamma=0.1, epsilon=.1)
+    svr = MultiOutputRegressor(SVR(kernel='rbf', C=100, gamma=0.1, epsilon=.1))
     svr.fit(X_tr_f_flat, y_tr)
-    y_pred = inv(svr.predict(X_te_f_flat))
-    metrics = get_metrics(y_true, y_pred, last_known)
-    results.append(["SVR (RBF)", "ML", *metrics])
+    y_pred = inv_seq(svr.predict(X_te_f_flat))
+    metrics = get_metrics_detailed(y_true, y_pred, last_known)
+    results.append(["SVR (RBF)", "ML", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
     # Random Forest
     rf = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=42)
     rf.fit(X_tr_f_flat, y_tr)
-    y_pred = inv(rf.predict(X_te_f_flat))
-    metrics = get_metrics(y_true, y_pred, last_known)
-    results.append(["Random Forest", "ML", *metrics])
+    y_pred = inv_seq(rf.predict(X_te_f_flat))
+    metrics = get_metrics_detailed(y_true, y_pred, last_known)
+    results.append(["Random Forest", "ML", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
     # XGBoost
     xgb_m = xgb.XGBRegressor(n_estimators=100, n_jobs=-1, random_state=42)
     xgb_m.fit(X_tr_f_flat, y_tr)
-    y_pred = inv(xgb_m.predict(X_te_f_flat))
-    metrics = get_metrics(y_true, y_pred, last_known)
-    results.append(["XGBoost", "ML", *metrics])
-
-    # # LightGBM
-    # lgb_m = lgb.LGBMRegressor(n_estimators=100, verbose=-1, random_state=42)
-    # lgb_m.fit(X_tr_f_flat, y_tr)
-    # y_pred = inv(lgb_m.predict(X_te_f_flat))
-    # metrics = get_metrics(y_true, y_pred, last_known)
-    # results.append(["LightGBM", "ML", *metrics])
+    y_pred = inv_seq(xgb_m.predict(X_te_f_flat))
+    metrics = get_metrics_detailed(y_true, y_pred, last_known)
+    results.append(["XGBoost", "ML", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
     # --- 3. Deep Learning ---
-    print("Running DL Models (LSTM, Transformer)...")
+    print("Running DL Models...")
 
     # LSTM
-    lstm = LSTMModel(input_dim=2)
+    lstm = LSTMModel(input_dim=2, output_dim=HORIZON)
     lstm = train_dl_model(lstm, X_tr_r, y_tr)
-    y_pred = inv(predict_dl(lstm, X_te_r))
-    metrics = get_metrics(y_true, y_pred, last_known)
-    results.append(["LSTM", "DL", *metrics])
+    y_pred = inv_seq(predict_dl(lstm, X_te_r))
+    metrics = get_metrics_detailed(y_true, y_pred, last_known)
+    results.append(["LSTM", "DL", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
     # Transformer
-    tf = SimpleTransformer(input_dim=2)
+    tf = SimpleTransformer(input_dim=2, output_dim=HORIZON)
     tf = train_dl_model(tf, X_tr_r, y_tr)
-    y_pred = inv(predict_dl(tf, X_te_r))
-    metrics = get_metrics(y_true, y_pred, last_known)
-    results.append(["Transformer", "DL", *metrics])
+    y_pred = inv_seq(predict_dl(tf, X_te_r))
+    metrics = get_metrics_detailed(y_true, y_pred, last_known)
+    results.append(["Transformer", "DL", metrics[0], metrics[1], metrics[2], metrics[3][0], metrics[3][1], metrics[3][2], metrics[4]])
 
     # --- 4. OUR CHAMPION ---
-    results.append([MY_MODEL_NAME, "Ours", MY_R2, MY_RMSE, MY_ACC, MY_H_ACC])
+    # Manually append the detailed results
+    results.append([MY_MODEL_NAME, "Ours", MY_R2, MY_RMSE, MY_AVG_ACC, MY_DAY1_ACC, MY_DAY2_ACC, MY_DAY3_ACC, MY_H_ACC])
 
-    # --- Reporting & Sorting ---
-    cols = ["Model", "Type", "R2 Score", "RMSE", "Dir Acc", "High Vol Acc"]
-    # 關鍵：這裡按照 R2 Score 由大到小排序
-    res_df = pd.DataFrame(results, columns=cols).sort_values(by="R2 Score", ascending=False)
+    # --- Reporting ---
+    cols = ["Model", "Type", "R2", "RMSE", "Avg Acc", "Day1", "Day2", "Day3", "High Vol"]
+    res_df = pd.DataFrame(results, columns=cols).sort_values(by="R2", ascending=False)
 
-    print("\n" + "="*95)
-    print("🏆 GRAND UNIFIED BENCHMARK: E2E-ALR vs. EVERYONE 🏆")
-    print("="*95)
+    print("\n" + "="*120)
+    print("🏆 GRAND UNIFIED BENCHMARK: Sequence Forecast Breakdown (T+1 to T+3) 🏆")
+    print("="*120)
+    # 使用 pd.to_string 確保所有欄位都印出來，不省略
     print(res_df.to_string(index=False, float_format="%.4f"))
-    print("="*95)
-
-    # Plot
-    sns.set_style("whitegrid")
-    plt.figure(figsize=(12, 8))
-    # 畫圖時也使用排序過的 DataFrame
-    sns.barplot(data=res_df, y="Model", x="R2 Score", hue="Type", dodge=False, palette="Spectral")
-    plt.title("R2 Score Comparison (Ranked Best to Worst)")
-    plt.xlim(0, 1.0)
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
-    plt.tight_layout()
+    print("="*120)

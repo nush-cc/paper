@@ -155,8 +155,7 @@ class EnhancedDLinear(nn.Module):
 class HybridDirectionalLoss(nn.Module):
     def __init__(self, direction_weight=0.5, delta=10.0):
         super().__init__()
-        self.mse = nn.MSELoss()
-        self.huber = nn.HuberLoss(delta=delta)
+        self.huber = nn.HuberLoss(delta=delta, reduction='mean')
         self.dir_weight = direction_weight
 
     def forward(self, pred, target, prev_value):
@@ -203,7 +202,8 @@ def prepare_data(df, lookback=30, horizon=3, mode='raw'):
         X, y = [], []
         for i in range(len(data) - lookback - horizon + 1):
             X.append(data[i : i + lookback])
-            y.append(data[i + lookback + horizon - 1, 0])
+            # y.append(data[i + lookback + horizon - 1, 0])
+            y.append(data[i + lookback : i + lookback + horizon, 0])
         return np.array(X), np.array(y)
 
     X_train, y_train = create_sequences(train_feat_scaled, lookback, horizon)
@@ -216,7 +216,7 @@ def prepare_data(df, lookback=30, horizon=3, mode='raw'):
 
 # ==================== 3. Training Function ====================
 def train_v11(train_loader, test_loader, num_epochs=120, lr=0.001):
-    model = EnhancedDLinear(seq_len=30, pred_len=1, input_channels=2).to(DEVICE)
+    model = EnhancedDLinear(seq_len=30, pred_len=HORIZON, input_channels=2).to(DEVICE)
     criterion = HybridDirectionalLoss(direction_weight=0.5)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -226,7 +226,7 @@ def train_v11(train_loader, test_loader, num_epochs=120, lr=0.001):
         model.train()
         losses = []
         for batch in train_loader:
-            x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE).unsqueeze(-1)
+            x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE)
             optimizer.zero_grad()
             prev_val = x[:, -1, 0:1]
             out, _, _ = model(x)
@@ -244,35 +244,70 @@ def train_v11(train_loader, test_loader, num_epochs=120, lr=0.001):
 
     return model
 
-def get_metrics(targets, preds, last_knowns):
-    r2 = r2_score(targets, preds)
-    rmse = np.sqrt(mean_squared_error(targets, preds))
+# def get_metrics(targets, preds, last_knowns):
+#     r2 = r2_score(targets, preds)
+#     rmse = np.sqrt(mean_squared_error(targets, preds))
+#
+#     true_delta = targets - last_knowns
+#     pred_delta = preds - last_knowns
+#     dir_correct = (np.sign(true_delta) == np.sign(pred_delta))
+#     acc = np.mean(dir_correct)
+#
+#     magnitude = np.abs(true_delta)
+#     thresh = np.percentile(magnitude, 80)
+#     high_vol_mask = magnitude > thresh
+#     acc_high = np.mean(dir_correct[high_vol_mask]) if np.sum(high_vol_mask)>0 else 0
+#     return r2, rmse, acc, acc_high
 
+def get_metrics(targets, preds, last_knowns):
+    # targets, preds shape: (Num_Samples, Horizon)
+    # last_knowns shape: (Num_Samples, 1)
+
+    if last_knowns.ndim == 1:
+        last_knowns = last_knowns.reshape(-1, 1)
+
+    # 1. R2 & RMSE (整體數值誤差)
+    r2 = r2_score(targets.flatten(), preds.flatten())
+    rmse = np.sqrt(mean_squared_error(targets.flatten(), preds.flatten()))
+
+    # 2. 方向準確度 (細分 Day 1, Day 2, Day 3)
     true_delta = targets - last_knowns
     pred_delta = preds - last_knowns
-    dir_correct = (np.sign(true_delta) == np.sign(pred_delta))
-    acc = np.mean(dir_correct)
+    dir_correct = (np.sign(true_delta) == np.sign(pred_delta)) # Boolean Matrix (N, 3)
 
+    acc_avg = np.mean(dir_correct)       # 總平均
+    acc_steps = np.mean(dir_correct, axis=0) # [Day1_Acc, Day2_Acc, Day3_Acc]
+
+    # 3. 高波動準確度
     magnitude = np.abs(true_delta)
     thresh = np.percentile(magnitude, 80)
     high_vol_mask = magnitude > thresh
-    acc_high = np.mean(dir_correct[high_vol_mask]) if np.sum(high_vol_mask)>0 else 0
-    return r2, rmse, acc, acc_high
+
+    if np.sum(high_vol_mask) > 0:
+        acc_high = np.mean(dir_correct[high_vol_mask])
+    else:
+        acc_high = 0
+
+    # 多回傳一個 acc_steps
+    return r2, rmse, acc_avg, acc_steps, acc_high
 
 # ==================== Main Execution ====================
 if __name__ == "__main__":
+    if not dataset_path.exists():
+        print(f"Error: Dataset not found at {dataset_path}")
+        exit()
+
     df = pd.read_csv(dataset_path)
 
     # 1. Prepare Data
-    train_loader, test_loader, scalers_raw, _, _, _, _ = prepare_data(df, lookback=LOOKBACK, horizon=HORIZON, mode='raw')
+    train_loader, test_loader, scalers_raw, _, _, _, _ = prepare_data(df, lookback=LOOKBACK, horizon=HORIZON)
 
     # 2. Train Model
     model = train_v11(train_loader, test_loader)
 
-    # 3. Side-by-Side Evaluation (The Truth!)
+    # 3. Evaluation Loop (Fixed for Sequence)
     model.eval()
 
-    # Lists for metrics
     preds_dlinear = []
     preds_hybrid = []
     targets_all = []
@@ -286,70 +321,93 @@ if __name__ == "__main__":
             x, y = batch['raw_input'].to(DEVICE), batch['target'].to(DEVICE)
             B = x.shape[0]
 
-            # Re-run Forward Pass logic manually to separate components
+            # Re-run Forward Pass Manually
             seasonal_part, trend_part = model.decomp(x)
 
-            # Linear Parts
+            # Linear -> [B, 3]
             trend_out_linear = model.linear_trend(trend_part.reshape(B, -1))
             seasonal_out_linear = model.linear_seasonal(seasonal_part.reshape(B, -1))
 
-            # CNN Parts
+            # CNN -> [B, 3]
             trend_out_cnn = model.cnn_trend(trend_part)
             seasonal_out_cnn = model.cnn_seasonal(seasonal_part)
 
-            # Base Value (Last Input)
-            last_val = x[:, -1, 0:1]
+            last_val = x[:, -1, 0:1] # [B, 1]
 
-            # --- Prediction A: Pure DLinear (Assume Weights=0) ---
+            # Pred A: Pure DLinear
             pred_base = last_val + trend_out_linear + seasonal_out_linear
 
-            # --- Prediction B: Hybrid (Base + Weighted CNN) ---
+            # Pred B: Hybrid
             correction = (trend_w * trend_out_cnn) + (seas_w * seasonal_out_cnn)
             pred_full = pred_base + correction
 
-            # Store Scaled Results
-            preds_dlinear.append(pred_base.cpu().numpy().flatten())
-            preds_hybrid.append(pred_full.cpu().numpy().flatten())
-            targets_all.append(y.cpu().numpy().flatten())
-            last_knowns_all.append(last_val.cpu().numpy().flatten())
+            # 儲存結果 (不 Flatten，保留 Bx3 結構)
+            preds_dlinear.append(pred_base.cpu().numpy())
+            preds_hybrid.append(pred_full.cpu().numpy())
+            targets_all.append(y.cpu().numpy())
+            last_knowns_all.append(last_val.cpu().numpy())
 
-    # 4. Inverse Transform & Metrics
+    # 4. Inverse Transform (修正版)
     scaler = scalers_raw['target']
 
-    # Helper to inverse and flatten
-    def inv(data):
-        return scaler.inverse_transform(np.concatenate(data).reshape(-1, 1)).flatten()
+    def inv_seq(data_list):
+        # 1. Stack: List of (B, 3) -> (N, 3)
+        data_arr = np.vstack(data_list)
+        N, H = data_arr.shape
 
-    y_true = inv(targets_all)
-    y_last = inv(last_knowns_all)
-    y_dlinear = inv(preds_dlinear)
-    y_hybrid = inv(preds_hybrid)
+        # 2. Flatten for Scaler: (N*3, 1)
+        data_flat = data_arr.reshape(-1, 1)
+        data_inv = scaler.inverse_transform(data_flat)
 
-    # Calculate Metrics
-    r2_base, rmse_base, acc_base, h_acc_base = get_metrics(y_true, y_dlinear, y_last)
-    r2_full, rmse_full, acc_full, h_acc_full = get_metrics(y_true, y_hybrid, y_last)
+        # 3. Reshape back: (N, 3)
+        return data_inv.reshape(N, H)
 
-    # 5. Print Comparison Table
-    print("\n" + "="*85)
-    print(f"🥊 HEAD-TO-HEAD: Pure DLinear vs. DLinear + CNN")
+    def inv_anchor(data_list):
+        data_arr = np.vstack(data_list) # (N, 1)
+        return scaler.inverse_transform(data_arr)
+
+    y_true = inv_seq(targets_all)
+    y_last = inv_anchor(last_knowns_all)
+    y_dlinear = inv_seq(preds_dlinear)
+    y_hybrid = inv_seq(preds_hybrid)
+
+    # 5. Metrics & Detailed Report
+    # 注意：這裡接收的變數變多了 (acc_steps)
+    r2_base, rmse_base, acc_base, step_base, h_acc_base = get_metrics(y_true, y_dlinear, y_last)
+    r2_full, rmse_full, acc_full, step_full, h_acc_full = get_metrics(y_true, y_hybrid, y_last)
+
+    print("\n" + "="*95)
+    print(f"📊 FINAL SEQUENCE FORECAST (Horizon={HORIZON}): Detailed Breakdown")
     print(f"   (Weights -> Trend: {trend_w:.4f} | Seasonal: {seas_w:.4f})")
-    print("="*85)
-    print(f"{'Metric':<15} | {'Pure DLinear':<15} | {'DLinear + CNN':<15} | {'Improvement':<15}")
-    print("-" * 85)
+    print("="*95)
+    print(f"{'Metric':<20} | {'Pure DLinear':<15} | {'Enhanced':<15} | {'Improvement':<15}")
+    print("-" * 95)
 
-    # R2 Score
+    # R2 & RMSE
     diff_r2 = r2_full - r2_base
-    print(f"{'R2 Score':<15} | {r2_base:<15.4f} | {r2_full:<15.4f} | {diff_r2:+.4f} {'✅' if diff_r2>0 else '❌'}")
+    print(f"{'R2 Score (Overall)':<20} | {r2_base:<15.4f} | {r2_full:<15.4f} | {diff_r2:+.4f} {'✅' if diff_r2>0 else '❌'}")
 
-    # RMSE
     diff_rmse = rmse_full - rmse_base
-    print(f"{'RMSE (Lower=Better)':<15} | {rmse_base:<15.4f} | {rmse_full:<15.4f} | {diff_rmse:+.4f} {'✅' if diff_rmse<0 else '❌'}")
+    print(f"{'RMSE (Overall)':<20} | {rmse_base:<15.4f} | {rmse_full:<15.4f} | {diff_rmse:+.4f} {'✅' if diff_rmse<0 else '❌'}")
 
-    # Direction Accuracy
+    print("-" * 95)
+    print("🎯 Direction Accuracy (Win Rate)")
+
+    # 總平均
     diff_acc = acc_full - acc_base
-    print(f"{'Direction Acc':<15} | {acc_base:<15.4f} | {acc_full:<15.4f} | {diff_acc:+.4f} {'✅' if diff_acc>0 else '❌'}")
+    print(f"{'  Average (All Days)':<20} | {acc_base:<15.4f} | {acc_full:<15.4f} | {diff_acc:+.4f} {'✅' if diff_acc>0 else '❌'}")
 
-    # High Volatility Accuracy
+    # Day-wise Breakdown (這就是你要的序列效果！)
+    for i in range(HORIZON):
+        d_base = step_base[i]
+        d_full = step_full[i]
+        diff = d_full - d_base
+        day_label = f"  Day {i+1} (T+{i+1})"
+        print(f"{day_label:<20} | {d_base:<15.4f} | {d_full:<15.4f} | {diff:+.4f} {'✅' if diff>0 else '❌'}")
+
+    print("-" * 95)
+
+    # High Volatility
     diff_h_acc = h_acc_full - h_acc_base
-    print(f"{'High Vol Acc':<15} | {h_acc_base:<15.4f} | {h_acc_full:<15.4f} | {diff_h_acc:+.4f} {'✅' if diff_h_acc>0 else '❌'}")
-    print("="*85)
+    print(f"{'High Volatility Acc':<20} | {h_acc_base:<15.4f} | {h_acc_full:<15.4f} | {diff_h_acc:+.4f} {'✅' if diff_h_acc>0 else '❌'}")
+    print("="*95)
