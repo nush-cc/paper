@@ -27,6 +27,7 @@ from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 import warnings
+
 warnings.filterwarnings('ignore')
 # from scipy import stats
 # from statsmodels.stats.diagnostic import acorr_ljungbox
@@ -34,6 +35,7 @@ warnings.filterwarnings('ignore')
 # Import modwtpy
 try:
     from modwt import modwt, imodwt, modwtmra
+
     print("[Setup] modwtpy imported successfully.")
 except ImportError:
     print("[Setup] Error: modwtpy not found. Please install it:")
@@ -75,12 +77,12 @@ class MODWTDecomposer:
             mra = modwtmra(w, self.wavelet)
             components = {}
             for i in range(self.level):
-                components[f'cD{i+1}'] = mra[i]
+                components[f'cD{i + 1}'] = mra[i]
             components[f'cA{self.level}_trend'] = mra[-1]
         else:
             components = {}
             for i in range(self.level):
-                components[f'cD{i+1}'] = w[i]
+                components[f'cD{i + 1}'] = w[i]
             components[f'cA{self.level}_trend'] = w[-1]
 
         self.components_names = list(components.keys())
@@ -88,10 +90,10 @@ class MODWTDecomposer:
 
     def get_component_energies(self, components):
         """Calculate energy percentage for each component"""
-        total_energy = sum(np.sum(comp**2) for comp in components.values())
+        total_energy = sum(np.sum(comp ** 2) for comp in components.values())
         energies = {}
         for name, comp in components.items():
-            energy_pct = np.sum(comp**2) / total_energy * 100
+            energy_pct = np.sum(comp ** 2) / total_energy * 100
             energies[name] = energy_pct
         return energies
 
@@ -143,7 +145,7 @@ class AttentionExpert(nn.Module):
 
         # GRU backbone (for high-frequency residual predictions and direction accuracy)
         self.gru = nn.GRU(input_size, hidden_size, num_layers,
-                         batch_first=True, dropout=dropout if num_layers > 1 else 0)
+                          batch_first=True, dropout=dropout if num_layers > 1 else 0)
         self.dropout = nn.Dropout(dropout)
 
         # Temporal Attention (Bahdanau style)
@@ -160,68 +162,71 @@ class AttentionExpert(nn.Module):
         )
 
     def forward(self, x):
-            """
-            修正後的 Attention：讓最後一個時間點 (Query) 去關注過去所有時間點 (Keys)
-            """
-            # gru_out: [batch, seq_len, hidden_size] -> 這是 Keys
-            # h_n:     [num_layers, batch, hidden_size] -> 這是最後的狀態
-            gru_out, h_n = self.gru(x)
-            
-            # 1. 定義 Query (取最後一層的最後一個時間點狀態)
-            # h_n[-1] 形狀是 [batch, hidden_size]
-            # 我們需要把它擴充成 [batch, seq_len, hidden_size] 以便跟序列做運算，或者直接用廣播
-            query_vector = h_n[-1] 
+        """
+        修正後的 Attention：讓最後一個時間點 (Query) 去關注過去所有時間點 (Keys)
+        """
+        # gru_out: [batch, seq_len, hidden_size] -> 這是 Keys
+        # h_n:     [num_layers, batch, hidden_size] -> 這是最後的狀態
+        gru_out, h_n = self.gru(x)
 
-            # 2. 計算 Attention Score (Bahdanau Style)
-            # Score = V * tanh(Wq * Query + Wk * Keys)
-            
-            # [batch, 1, attn_size]
-            query_proj = self.attention_query(query_vector).unsqueeze(1) 
-            
-            # [batch, seq_len, attn_size]
-            key_proj = self.attention_key(gru_out) 
-            
-            # 兩者相加 (PyTorch 會自動廣播 Query 到每一個 Time Step)
-            # 意義：比較 "今天狀態" 與 "過去每一天狀態"
-            attention_logits = torch.tanh(query_proj + key_proj)
-            
-            # [batch, seq_len, 1]
-            attention_logits = self.attention_score(attention_logits)
+        # 1. 定義 Query (取最後一層的最後一個時間點狀態)
+        # h_n[-1] 形狀是 [batch, hidden_size]
+        # 我們需要把它擴充成 [batch, seq_len, hidden_size] 以便跟序列做運算，或者直接用廣播
+        query_vector = h_n[-1]
 
-            # 3. Softmax (歸一化)
-            attention_weights = torch.softmax(attention_logits.squeeze(-1), dim=1)
+        # 2. 計算 Attention Score (Bahdanau Style)
+        # Score = V * tanh(Wq * Query + Wk * Keys)
 
-            # 4. 加權總和
-            context_vector = torch.sum(
-                gru_out * attention_weights.unsqueeze(-1),
-                dim=1
-            )
+        # [batch, 1, attn_size]
+        query_proj = self.attention_query(query_vector).unsqueeze(1)
 
-            context_vector = self.dropout(context_vector)
-            prediction = self.fc(context_vector)
+        # [batch, seq_len, attn_size]
+        key_proj = self.attention_key(gru_out)
 
-            return prediction, attention_weights
+        # 兩者相加 (PyTorch 會自動廣播 Query 到每一個 Time Step)
+        # 意義：比較 "今天狀態" 與 "過去每一天狀態"
+        attention_logits = torch.tanh(query_proj + key_proj)
+
+        # [batch, seq_len, 1]
+        attention_logits = self.attention_score(attention_logits)
+
+        # 3. Softmax (歸一化)
+        attention_weights = torch.softmax(attention_logits.squeeze(-1), dim=1)
+
+        # 4. 加權總和
+        context_vector = torch.sum(
+            gru_out * attention_weights.unsqueeze(-1),
+            dim=1
+        )
+
+        context_vector = self.dropout(context_vector)
+        prediction = self.fc(context_vector)
+
+        return prediction, attention_weights
 
 
 class TrendExpert(AttentionExpert):
     """Expert 1: Trend prediction (cA4 only)"""
+
     def __init__(self, input_size=1, hidden_size=32, num_layers=2, dropout=0.2):
         super().__init__(input_size, hidden_size, num_layers, dropout,
-                        attention_size=16, expert_name="TrendExpert")
+                         attention_size=16, expert_name="TrendExpert")
 
 
 class CyclicExpert(AttentionExpert):
     """Expert 2: Cyclic prediction (cD4, cD3)"""
+
     def __init__(self, input_size=2, hidden_size=32, num_layers=2, dropout=0.3):
         super().__init__(input_size, hidden_size, num_layers, dropout,
-                        attention_size=16, expert_name="CyclicExpert")
+                         attention_size=16, expert_name="CyclicExpert")
 
 
 class HighFreqExpert(AttentionExpert):
     """Expert 3: High-frequency prediction (cD2, cD1)"""
+
     def __init__(self, input_size=2, hidden_size=32, num_layers=2, dropout=0.4):
         super().__init__(input_size, hidden_size, num_layers, dropout,
-                        attention_size=16, expert_name="HighFreqExpert")
+                         attention_size=16, expert_name="HighFreqExpert")
 
 
 # ==================== Gating Network ====================
@@ -254,12 +259,13 @@ class HybridDirectionalLoss(nn.Module):
         Differentiable Directional Loss using Tanh approximation.
         Solves the 'Zero Gradient' problem of torch.sign().
         """
+
     def __init__(self, delta=1.0, direction_weight=0.5, penalty_scale=10.0, sharpness=5.0):
         super().__init__()
         self.huber = nn.HuberLoss(delta=delta)
         self.direction_weight = direction_weight
         self.penalty_scale = penalty_scale
-        self.sharpness = sharpness # 控制 tanh 有多陡峭 (越像 sign)
+        self.sharpness = sharpness  # 控制 tanh 有多陡峭 (越像 sign)
 
     def forward(self, pred, target, prev_value):
         # 1. Magnitude Loss
@@ -300,7 +306,7 @@ class RawLSTM(nn.Module):
         self.hidden_size = hidden_size
 
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0)
+                            batch_first=True, dropout=dropout if num_layers > 1 else 0)
         self.dropout = nn.Dropout(dropout)
 
         self.fc = nn.Sequential(
@@ -362,7 +368,7 @@ class AdvancedResidualMODWTMoE(nn.Module):
         # 1. Anchor: 這裡要注意！
         # raw_input 是 [batch, seq, 3]，我們預測的目標是 Volatility (第 0 個 feature)
         # 所以 prev_value 只要取第 0 個 channel
-        prev_value = raw_input[:, -1, 0:1] # [batch, 1]
+        prev_value = raw_input[:, -1, 0:1]  # [batch, 1]
 
         # 2. Base Branch: LSTM 吃所有特徵 (Vol, RSI, Ret) 來預測 Delta
         base_delta = self.base_branch(raw_input)
@@ -386,7 +392,7 @@ class AdvancedResidualMODWTMoE(nn.Module):
         mean_wavelets = torch.cat([e1_mean, e2_mean, e3_mean], dim=1)
 
         # [CHANGE] Raw data last timestep (包含 Vol, RSI, Ret)
-        raw_last = raw_input[:, -1, :] # [batch, 3]
+        raw_last = raw_input[:, -1, :]  # [batch, 3]
 
         # Combine Context: 5 + 5 + 3 = 13
         context_input = torch.cat([last_wavelets, mean_wavelets, raw_last], dim=1)
@@ -425,7 +431,7 @@ def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-    df['RSI'] = df['RSI'].fillna(50) # Fill NaN with neutral 50
+    df['RSI'] = df['RSI'].fillna(50)  # Fill NaN with neutral 50
 
     # Drop NaN from Volatility calc
     df = df.dropna().reset_index(drop=True)
@@ -493,7 +499,7 @@ def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
             try:
                 components = decomposer.decompose(buffer_vol, use_mra=True)
             except Exception as e:
-                components = {f'cD{i+1}': np.zeros(len(buffer_vol)) for i in range(level)}
+                components = {f'cD{i + 1}': np.zeros(len(buffer_vol)) for i in range(level)}
                 components[f'cA{level}_trend'] = np.zeros(len(buffer_vol))
 
             # Fill sequence
@@ -549,7 +555,7 @@ def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
 
     if DO_INPUT_SHUFFLE:
         print("\nWARNING: INPUT SHUFFLE CHECK - DESTROYING FEATURES")
-        
+
         # 方法 A: 隨機打亂 (保留分佈，破壞順序) -> 測試是否依賴時間結構
         # 注意：要對 train_e1, e2, e3 和 raw 全部打亂
         idx = np.random.permutation(len(train_e1))
@@ -557,16 +563,16 @@ def prepare_modwt_data(df, vol_window=7, lookback=30, forecast_horizon=1,
         train_e2 = train_e2[idx]
         train_e3 = train_e3[idx]
         train_raw = train_raw[idx]
-        
+
         idx_test = np.random.permutation(len(test_e1))
         test_e1 = test_e1[idx_test]
         test_e2 = test_e2[idx_test]
         test_e3 = test_e3[idx_test]
         test_raw = test_raw[idx_test]
-        
+
         # Target 保持原樣！不動！
         # train_targets = train_targets 
-        
+
         print("  Features have been destroyed. Targets remain real.")
 
     # Datasets
@@ -609,8 +615,8 @@ def train_hybrid_moe_curriculum(train_loader, test_loader, num_epochs=100,
         'train_loss': [], 'test_loss': [],
         'train_rmse': [], 'train_mae': [],
         'epochs': [], 'alpha_mean': [],
-        'base_pred_mean': [], 'moe_pred_mean': [], # 補上這兩個，繪圖函數需要
-        'branch_weight': [], # 雖然改用動態權重，但為了相容繪圖函數保留此key (存成 alpha mean)
+        'base_pred_mean': [], 'moe_pred_mean': [],  # 補上這兩個，繪圖函數需要
+        'branch_weight': [],  # 雖然改用動態權重，但為了相容繪圖函數保留此key (存成 alpha mean)
         'stage': []
     }
 
@@ -711,17 +717,17 @@ def train_hybrid_moe_curriculum(train_loader, test_loader, num_epochs=100,
         history['epochs'].append(epoch + 1)
         history['stage'].append(1)
         history['alpha_mean'].append(0.0)
-        history['branch_weight'].append(0.0) # For compatibility
+        history['branch_weight'].append(0.0)  # For compatibility
 
         # Stage 1: Base is everything, MoE is 0
         history['base_pred_mean'].append(np.mean(all_base))
         history['moe_pred_mean'].append(0.0)
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"  Epoch {epoch+1:3d}/{stage1_epochs} | Loss: {avg_train_loss:.6f} | RMSE: {train_rmse:.4f}")
+            print(f"  Epoch {epoch + 1:3d}/{stage1_epochs} | Loss: {avg_train_loss:.6f} | RMSE: {train_rmse:.4f}")
 
     # ==================== STAGE 2: Joint Training ====================
-    print(f"\n[Stage 2] Joint Training (Unfreezing All) (Epochs {stage1_epochs+1}-{num_epochs})")
+    print(f"\n[Stage 2] Joint Training (Unfreezing All) (Epochs {stage1_epochs + 1}-{num_epochs})")
 
     model.expert1.requires_grad_(True)
     model.expert2.requires_grad_(True)
@@ -814,18 +820,19 @@ def train_hybrid_moe_curriculum(train_loader, test_loader, num_epochs=100,
         current_epoch = stage1_epochs + epoch + 1
         history['train_loss'].append(avg_train_loss)
         history['test_loss'].append(avg_test_loss)
-        history['train_rmse'].append(train_rmse) # [FIX]
-        history['train_mae'].append(train_mae)   # [FIX]
+        history['train_rmse'].append(train_rmse)  # [FIX]
+        history['train_mae'].append(train_mae)  # [FIX]
         history['epochs'].append(current_epoch)
         history['stage'].append(2)
         history['alpha_mean'].append(avg_alpha)
-        history['branch_weight'].append(avg_alpha) # For compatibility
+        history['branch_weight'].append(avg_alpha)  # For compatibility
 
-        history['base_pred_mean'].append(np.mean(all_base)) # [FIX]
-        history['moe_pred_mean'].append(np.mean(all_moe))   # [FIX]
+        history['base_pred_mean'].append(np.mean(all_base))  # [FIX]
+        history['moe_pred_mean'].append(np.mean(all_moe))  # [FIX]
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"  Epoch {current_epoch:3d}/{num_epochs} | Loss: {avg_train_loss:.6f} | RMSE: {train_rmse:.4f} | Alpha: {avg_alpha:.3f}")
+            print(
+                f"  Epoch {current_epoch:3d}/{num_epochs} | Loss: {avg_train_loss:.6f} | RMSE: {train_rmse:.4f} | Alpha: {avg_alpha:.3f}")
 
         if avg_test_loss < best_test_loss:
             best_test_loss = avg_test_loss
@@ -846,8 +853,8 @@ def evaluate(model, data_loader, device):
 
     all_preds = []
     all_targets = []
-    all_base_preds = [] 
-    all_moe_deltas = [] 
+    all_base_preds = []
+    all_moe_deltas = []
     all_expert_preds = []
     all_gating_weights = []
     all_alphas = []
@@ -865,8 +872,8 @@ def evaluate(model, data_loader, device):
 
             # 1. 取得 Naive Prediction (即 t-1 時刻的值)
             # 這是我們用來比較的基準：假設明天波動率 = 今天波動率
-            prev_value = raw_input[:, -1, 0:1] 
-            
+            prev_value = raw_input[:, -1, 0:1]
+
             # [新增] 收集 Naive 預測
             all_naive_preds.append(prev_value.cpu().numpy())
 
@@ -900,7 +907,7 @@ def evaluate(model, data_loader, device):
     expert_preds_all = np.concatenate(all_expert_preds, axis=0)
     gating_weights = np.concatenate(all_gating_weights, axis=0)
     alphas = np.concatenate(all_alphas, axis=0).flatten()
-    
+
     # [新增] Naive 數組
     naive_predictions = np.concatenate(all_naive_preds, axis=0).flatten()
 
@@ -913,7 +920,7 @@ def evaluate(model, data_loader, device):
     # ==========================================
     # Metrics & Naive Comparison
     # ==========================================
-    
+
     # 1. Model Metrics
     rmse = np.sqrt(mean_squared_error(targets, predictions))
     mae = mean_absolute_error(targets, predictions)
@@ -924,23 +931,23 @@ def evaluate(model, data_loader, device):
     diff_true = targets - naive_predictions
     # 預測變化方向 (t -> t+1)
     diff_pred = predictions - naive_predictions
-    
+
     # 排除變化量極小的雜訊 (Optional, 這裡先用標準計算)
     direction_acc = np.mean(np.sign(diff_true) == np.sign(diff_pred))
 
     # 2. Naive Metrics (Baseline)
     naive_rmse = np.sqrt(mean_squared_error(targets, naive_predictions))
     naive_mae = mean_absolute_error(targets, naive_predictions)
-    
+
     # 3. Naive Direction Accuracy (Lag Test)
     # 測試邏輯：如果我們單純把實際曲線往後移一格 (Lag 1)，它的方向準確率是多少？
     # 這是檢測 "Auto-Correlation" (自相關)
     # 我們比較 [t vs t+1] 的真實變化 和 [t-1 vs t] 的真實變化
     # 注意：這裡我們要對齊時間軸，所以會少一個樣本
-    
+
     true_dir_current = np.sign(targets[1:] - targets[:-1])
     naive_dir_lagged = np.sign(naive_predictions[1:] - naive_predictions[:-1])
-    
+
     naive_direction_acc = np.mean(true_dir_current == naive_dir_lagged)
 
     metrics = {
@@ -948,13 +955,15 @@ def evaluate(model, data_loader, device):
         'mae': mae,
         'r2': r2,
         'direction_acc': direction_acc,
-        'naive_rmse': naive_rmse,        # [新增]
-        'naive_mae': naive_mae,          # [新增]
-        'naive_direction_acc': naive_direction_acc # [新增]
+        'naive_rmse': naive_rmse,  # [新增]
+        'naive_mae': naive_mae,  # [新增]
+        'naive_direction_acc': naive_direction_acc  # [新增]
     }
 
     return (metrics, predictions, targets, base_predictions, moe_deltas,
             expert_preds_all, gating_weights, attention_weights_concat, alphas)
+
+
 # ==================== Visualization ====================
 def plot_training_curves(history, output_path='../results/training_history.png'):
     """Plot training curves"""
@@ -968,8 +977,8 @@ def plot_training_curves(history, output_path='../results/training_history.png')
     # Find stage transition
     stage_transition = None
     for i in range(1, len(stages)):
-        if stages[i] != stages[i-1]:
-            stage_transition = epochs[i-1]
+        if stages[i] != stages[i - 1]:
+            stage_transition = epochs[i - 1]
             break
 
     # Loss
@@ -977,7 +986,7 @@ def plot_training_curves(history, output_path='../results/training_history.png')
     axes[0, 0].plot(epochs, history['test_loss'], 'r-', label='Test Loss', linewidth=2)
     if stage_transition:
         axes[0, 0].axvline(stage_transition, color='green', linestyle='--', linewidth=2,
-                          label=f'Stage Transition (Epoch {stage_transition})', alpha=0.7)
+                           label=f'Stage Transition (Epoch {stage_transition})', alpha=0.7)
     axes[0, 0].set_xlabel('Epoch', fontsize=12)
     axes[0, 0].set_ylabel('Loss', fontsize=12)
     axes[0, 0].set_title('Training Loss (Two-Stage: LSTM-only → Heterogeneous Joint)', fontsize=14, fontweight='bold')
@@ -1009,7 +1018,7 @@ def plot_training_curves(history, output_path='../results/training_history.png')
     axes[1, 1].plot(epochs, history['branch_weight'], 'purple', linewidth=2)
     if stage_transition:
         axes[1, 1].axvline(stage_transition, color='green', linestyle='--', linewidth=2,
-                          label='Stage Transition', alpha=0.7)
+                           label='Stage Transition', alpha=0.7)
     axes[1, 1].set_xlabel('Epoch', fontsize=12)
     axes[1, 1].set_ylabel('Branch Weight', fontsize=12)
     axes[1, 1].set_title('Learned MoE Weight (Starts at 0.0)', fontsize=14, fontweight='bold')
@@ -1042,9 +1051,9 @@ def plot_predictions(test_targets_original, test_preds_original, test_base_preds
 
     # Errors
     axes[1].plot(time_idx, test_base_preds_original - test_targets_original, 'b-', alpha=0.7,
-                linewidth=1.5, label='LSTM Baseline Error')
+                 linewidth=1.5, label='LSTM Baseline Error')
     axes[1].plot(time_idx, test_preds_original - test_targets_original, 'orange', alpha=0.7,
-                linewidth=1.5, label='Hybrid Model Error')
+                 linewidth=1.5, label='Hybrid Model Error')
     axes[1].axhline(0, color='k', linestyle='--', alpha=0.5)
     axes[1].set_xlabel('Time Step', fontsize=12)
     axes[1].set_ylabel('Prediction Error (%)', fontsize=12)
@@ -1056,6 +1065,7 @@ def plot_predictions(test_targets_original, test_preds_original, test_base_preds
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {output_path}")
+
 
 def plot_gating_weights(gating_weights, test_targets_original, save_path='gating_weights.png'):
     """
@@ -1073,19 +1083,19 @@ def plot_gating_weights(gating_weights, test_targets_original, save_path='gating
         test_targets_original: 實際波動率值（用於regime分類）
         save_path: 圖片儲存路徑
     """
-    
+
     if isinstance(gating_weights, torch.Tensor):
         gating_weights = gating_weights.cpu().detach().numpy()
-    
+
     # 根據百分位數定義波動率regimes
     vol_33 = np.percentile(test_targets_original, 33)
     vol_67 = np.percentile(test_targets_original, 67)
-    
+
     # 分類到不同regimes
     low_mask = test_targets_original <= vol_33
     med_mask = (test_targets_original > vol_33) & (test_targets_original <= vol_67)
     high_mask = test_targets_original > vol_67
-    
+
     # 計算各regime的平均權重
     regimes = ['Low\nVolatility', 'Medium\nVolatility', 'High\nVolatility']
     expert1_means = [
@@ -1103,51 +1113,51 @@ def plot_gating_weights(gating_weights, test_targets_original, save_path='gating
         gating_weights[med_mask, 2].mean(),
         gating_weights[high_mask, 2].mean()
     ]
-    
+
     # 創建2個子圖
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
+
     # === 左圖：堆疊長條圖 ===
     x_pos = np.arange(len(regimes))
     width = 0.6
-    
+
     colors = ['#2ca02c', '#1f77b4', '#ff7f0e']  # 綠、藍、橘
-    
-    ax1.bar(x_pos, expert1_means, width, label='Expert 1 (Trend)', 
+
+    ax1.bar(x_pos, expert1_means, width, label='Expert 1 (Trend)',
             color=colors[0], alpha=0.85, edgecolor='white', linewidth=1.5)
     ax1.bar(x_pos, expert2_means, width, bottom=expert1_means,
-            label='Expert 2 (Cyclic)', color=colors[1], alpha=0.85, 
+            label='Expert 2 (Cyclic)', color=colors[1], alpha=0.85,
             edgecolor='white', linewidth=1.5)
-    
+
     bottoms = np.array(expert1_means) + np.array(expert2_means)
     ax1.bar(x_pos, expert3_means, width, bottom=bottoms,
             label='Expert 3 (High-Freq)', color=colors[2], alpha=0.85,
             edgecolor='white', linewidth=1.5)
-    
+
     # 在長條圖內添加百分比標籤
     for i in range(len(regimes)):
         # Expert 1
         if expert1_means[i] > 0.08:
-            ax1.text(i, expert1_means[i]/2, f'{expert1_means[i]*100:.1f}%',
-                    ha='center', va='center', fontweight='bold', 
-                    fontsize=11, color='white')
-        
+            ax1.text(i, expert1_means[i] / 2, f'{expert1_means[i] * 100:.1f}%',
+                     ha='center', va='center', fontweight='bold',
+                     fontsize=11, color='white')
+
         # Expert 2
         if expert2_means[i] > 0.08:
-            ax1.text(i, expert1_means[i] + expert2_means[i]/2, 
-                    f'{expert2_means[i]*100:.1f}%',
-                    ha='center', va='center', fontweight='bold',
-                    fontsize=11, color='white')
-        
+            ax1.text(i, expert1_means[i] + expert2_means[i] / 2,
+                     f'{expert2_means[i] * 100:.1f}%',
+                     ha='center', va='center', fontweight='bold',
+                     fontsize=11, color='white')
+
         # Expert 3
         if expert3_means[i] > 0.08:
-            ax1.text(i, expert1_means[i] + expert2_means[i] + expert3_means[i]/2,
-                    f'{expert3_means[i]*100:.1f}%',
-                    ha='center', va='center', fontweight='bold',
-                    fontsize=11, color='white')
-    
+            ax1.text(i, expert1_means[i] + expert2_means[i] + expert3_means[i] / 2,
+                     f'{expert3_means[i] * 100:.1f}%',
+                     ha='center', va='center', fontweight='bold',
+                     fontsize=11, color='white')
+
     ax1.set_ylabel('Gating Weight', fontsize=13, fontweight='bold')
-    ax1.set_title('Gating Weights by Volatility Regime (Stacked)', 
+    ax1.set_title('Gating Weights by Volatility Regime (Stacked)',
                   fontsize=14, fontweight='bold', pad=15)
     ax1.set_xticks(x_pos)
     ax1.set_xticklabels(regimes, fontsize=12)
@@ -1155,17 +1165,17 @@ def plot_gating_weights(gating_weights, test_targets_original, save_path='gating
     ax1.legend(loc='upper left', frameon=True, framealpha=0.95, fontsize=11)
     ax1.grid(axis='y', alpha=0.3, linestyle='--')
     ax1.set_axisbelow(True)
-    
+
     # === 右圖：折線圖展示動態變化 ===
     x_pos_line = np.arange(len(regimes))
-    
-    ax2.plot(x_pos_line, expert1_means, marker='o', markersize=12, 
+
+    ax2.plot(x_pos_line, expert1_means, marker='o', markersize=12,
              linewidth=3, label='Expert 1 (Trend)', color=colors[0], alpha=0.85)
     ax2.plot(x_pos_line, expert2_means, marker='s', markersize=12,
              linewidth=3, label='Expert 2 (Cyclic)', color=colors[1], alpha=0.85)
     ax2.plot(x_pos_line, expert3_means, marker='^', markersize=12,
              linewidth=3, label='Expert 3 (High-Freq)', color=colors[2], alpha=0.85)
-    
+
     ax2.set_ylabel('Gating Weight', fontsize=13, fontweight='bold')
     ax2.set_title('Gating Weight Dynamics Across Regimes',
                   fontsize=14, fontweight='bold', pad=15)
@@ -1175,11 +1185,11 @@ def plot_gating_weights(gating_weights, test_targets_original, save_path='gating
     ax2.legend(loc='best', frameon=True, framealpha=0.95, fontsize=11)
     ax2.grid(True, alpha=0.3, linestyle='--')
     ax2.set_axisbelow(True)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     print(f"✓ Gating weights plot saved to {save_path}")
     print(f"  Regime thresholds: Low ≤ {vol_33:.2f}% < Medium ≤ {vol_67:.2f}% < High")
 
@@ -1200,43 +1210,43 @@ def plot_attention_maps(attention_weights, save_path='attention_maps.png'):
                           每個都是 [num_samples, seq_len] array
         save_path: 圖片儲存路徑
     """
-    
+
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    
+
     # 提取attention weights
     attn1 = attention_weights['expert1']  # [num_samples, 30]
     attn2 = attention_weights['expert2']
     attn3 = attention_weights['expert3']
-    
+
     # 計算所有樣本的平均attention
     mean_attn1 = attn1.mean(axis=0)
     mean_attn2 = attn2.mean(axis=0)
     mean_attn3 = attn3.mean(axis=0)
-    
+
     # 計算標準差（用於confidence intervals）
     std_attn1 = attn1.std(axis=0)
     std_attn2 = attn2.std(axis=0)
     std_attn3 = attn3.std(axis=0)
-    
+
     timesteps = np.arange(len(mean_attn1))
-    
+
     colors = ['#2ca02c', '#1f77b4', '#ff7f0e']  # 與expert顏色一致
-    
+
     # ==================== 子圖1: Expert 1 (Trend) ====================
-    axes[0, 0].plot(timesteps, mean_attn1, color=colors[0], linewidth=2.5, 
+    axes[0, 0].plot(timesteps, mean_attn1, color=colors[0], linewidth=2.5,
                     label='Mean Attention', marker='o', markersize=4, markevery=5)
     axes[0, 0].fill_between(timesteps, mean_attn1 - std_attn1, mean_attn1 + std_attn1,
                             color=colors[0], alpha=0.25, label='±1 Std Dev')
-    axes[0, 0].axvline(len(mean_attn1) - 1, color='red', linestyle='--', 
+    axes[0, 0].axvline(len(mean_attn1) - 1, color='red', linestyle='--',
                        linewidth=1.5, alpha=0.5, label='Most Recent')
     axes[0, 0].set_xlabel('Lookback Days (0 = t-30, 29 = t-1)', fontsize=11)
     axes[0, 0].set_ylabel('Attention Weight', fontsize=11)
-    axes[0, 0].set_title('Expert 1 (Trend) - Temporal Attention', 
+    axes[0, 0].set_title('Expert 1 (Trend) - Temporal Attention',
                          fontsize=12, fontweight='bold')
     axes[0, 0].grid(alpha=0.3, linestyle='--')
     axes[0, 0].legend(fontsize=10, loc='best')
     axes[0, 0].set_xlim([-0.5, len(mean_attn1) - 0.5])
-    
+
     # ==================== 子圖2: Expert 2 (Cyclic) ====================
     axes[0, 1].plot(timesteps, mean_attn2, color=colors[1], linewidth=2.5,
                     label='Mean Attention', marker='s', markersize=4, markevery=5)
@@ -1251,7 +1261,7 @@ def plot_attention_maps(attention_weights, save_path='attention_maps.png'):
     axes[0, 1].grid(alpha=0.3, linestyle='--')
     axes[0, 1].legend(fontsize=10, loc='best')
     axes[0, 1].set_xlim([-0.5, len(mean_attn2) - 0.5])
-    
+
     # ==================== 子圖3: Expert 3 (High-Freq) ====================
     axes[1, 0].plot(timesteps, mean_attn3, color=colors[2], linewidth=2.5,
                     label='Mean Attention', marker='^', markersize=4, markevery=5)
@@ -1266,9 +1276,9 @@ def plot_attention_maps(attention_weights, save_path='attention_maps.png'):
     axes[1, 0].grid(alpha=0.3, linestyle='--')
     axes[1, 0].legend(fontsize=10, loc='best')
     axes[1, 0].set_xlim([-0.5, len(mean_attn3) - 0.5])
-    
+
     # ==================== 子圖4: 所有Expert的綜合比較 ====================
-    axes[1, 1].plot(timesteps, mean_attn1, color=colors[0], linewidth=2.5, 
+    axes[1, 1].plot(timesteps, mean_attn1, color=colors[0], linewidth=2.5,
                     label='Expert 1 (Trend)', alpha=0.85, marker='o', markersize=3, markevery=5)
     axes[1, 1].plot(timesteps, mean_attn2, color=colors[1], linewidth=2.5,
                     label='Expert 2 (Cyclic)', alpha=0.85, marker='s', markersize=3, markevery=5)
@@ -1283,16 +1293,17 @@ def plot_attention_maps(attention_weights, save_path='attention_maps.png'):
     axes[1, 1].grid(alpha=0.3, linestyle='--')
     axes[1, 1].legend(fontsize=10, loc='best')
     axes[1, 1].set_xlim([-0.5, len(mean_attn1) - 0.5])
-    
+
     # 添加總標題
     fig.suptitle('Temporal Attention Mechanisms: Expert Focus Across Lookback Window',
                  fontsize=14, fontweight='bold', y=0.995)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     print(f"✓ Attention maps saved to {save_path}")
+
 
 def plot_alpha_distribution(alphas, save_path='../results/alpha_dist.png'):
     """
@@ -1303,50 +1314,51 @@ def plot_alpha_distribution(alphas, save_path='../results/alpha_dist.png'):
     # 確保 alphas 是 numpy array
     if isinstance(alphas, torch.Tensor):
         alphas = alphas.cpu().detach().numpy()
-        
+
     plt.figure(figsize=(10, 6))
-    
+
     # 繪製直方圖
-    n, bins, patches = plt.hist(alphas, bins=50, color='#9467bd', alpha=0.7, 
+    n, bins, patches = plt.hist(alphas, bins=50, color='#9467bd', alpha=0.7,
                                 edgecolor='black', linewidth=0.8, label='Alpha Frequency')
-    
+
     # 繪製平均線
     mean_val = alphas.mean()
-    plt.axvline(mean_val, color='#d62728', linestyle='--', linewidth=2, 
+    plt.axvline(mean_val, color='#d62728', linestyle='--', linewidth=2,
                 label=f'Mean: {mean_val:.4f}')
-    
+
     # 裝飾圖表
-    plt.title('Distribution of Meta-Gate Alpha Values\n(0 = LSTM Base Only, 1 = Full Expert Residual)', 
+    plt.title('Distribution of Meta-Gate Alpha Values\n(0 = LSTM Base Only, 1 = Full Expert Residual)',
               fontsize=14, fontweight='bold')
     plt.xlabel('Alpha Value', fontsize=12)
     plt.ylabel('Frequency (Number of Samples)', fontsize=12)
     plt.legend(loc='upper right', frameon=True, fontsize=11)
     plt.grid(alpha=0.3, linestyle='--')
-    plt.xlim(0, 1) # Alpha 範圍被 Sigmoid 限制在 0-1 之間
-    
+    plt.xlim(0, 1)  # Alpha 範圍被 Sigmoid 限制在 0-1 之間
+
     # 加入文字註解
-    plt.text(0.02, plt.ylim()[1]*0.95, 'Mostly Base ←', fontsize=10, color='gray', ha='left')
-    plt.text(0.98, plt.ylim()[1]*0.95, '→ Mostly Expert', fontsize=10, color='gray', ha='right')
+    plt.text(0.02, plt.ylim()[1] * 0.95, 'Mostly Base ←', fontsize=10, color='gray', ha='left')
+    plt.text(0.98, plt.ylim()[1] * 0.95, '→ Mostly Expert', fontsize=10, color='gray', ha='right')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    
+
     print(f"✓ Alpha distribution plot saved to {save_path}")
+
 
 # ==================== Main ====================
 if __name__ == "__main__":
-    os.makedirs('../results', exist_ok=True)
+    os.makedirs('results', exist_ok=True)
 
     RUN_MODE = "NORMAL"  # 可選：NORMAL, SANITY_INPUT_SHUFFLE, SANITY_TARGET_SHUFFLE
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("[MODWT-MoE Volatility Forecasting - Production Model]")
-    print("="*80)
+    print("=" * 80)
 
     # 1. Load data
     print("\n[Loading Data]")
-    df = pd.read_csv("../dataset/USD_TWD.csv")
+    df = pd.read_csv("dataset/USD_TWD.csv")
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     print(f"  Loaded {len(df)} days")
@@ -1389,7 +1401,7 @@ if __name__ == "__main__":
 
     # 5. Inverse Transform (還原回真實波動率數值)
     target_scaler = scalers['target']
-    
+
     test_preds_centered = target_scaler.inverse_transform(test_preds.reshape(-1, 1)).flatten()
     test_targets_centered = target_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
     test_base_preds_centered = target_scaler.inverse_transform(test_base_preds.reshape(-1, 1)).flatten()
@@ -1406,7 +1418,7 @@ if __name__ == "__main__":
     r2_original = r2_score(test_targets_original, test_preds_original)
     rmse_original = np.sqrt(mean_squared_error(test_targets_original, test_preds_original))
     mae_original = mean_absolute_error(test_targets_original, test_preds_original)
-    
+
     # LSTM Base Metrics
     rmse_base = np.sqrt(mean_squared_error(test_targets_original, test_base_preds_original))
 
@@ -1419,44 +1431,44 @@ if __name__ == "__main__":
     # =========================================================================
     # [CONDITIONAL PRINTING] 根據模式決定顯示什麼報告
     # =========================================================================
-    print("\n" + "="*80)
-    
+    print("\n" + "=" * 80)
+
     if run_mode == "SANITY_INPUT_SHUFFLE":
         print(f"SANITY CHECK REPORT: INPUT DESTRUCTION MODE (X-Shuffle)")
-        print("="*80)
+        print("=" * 80)
         print("   TEST GOAL: Verify model fails when input features are destroyed.")
         print("   (We want to prove the model isn't just memorizing the output trend.)")
         print("-" * 60)
-        
+
         # 判斷 R2 (應該要是負的)
         print(f"   1. R² Score:            {r2_original:.4f}  ", end="")
 
         # 判斷 Direction (應該要在 50% 附近)
-        print(f"   2. Direction Accuracy:  {true_direction_acc*100:.2f}%   \n", end="")
-        
+        print(f"   2. Direction Accuracy:  {true_direction_acc * 100:.2f}%   \n", end="")
+
         print("-" * 60)
         print("   NOTE: Ignore internal metrics inside evaluate().")
         print("   The metrics above are calculated against the REAL target trend.")
 
     elif run_mode == "SANITY_TARGET_SHUFFLE":
         print(f"SANITY CHECK REPORT: TARGET SHUFFLE MODE (Y-Shuffle)")
-        print("="*80)
+        print("=" * 80)
         print("   TEST GOAL: Verify model fails when answers are randomized.")
         print("   (We want to prove there is no label leakage.)")
         print("-" * 60)
-        
+
         print(f"   R² Score: {r2_original:.4f} \n", end="")
 
     else:
         # NORMAL MODE (正常訓練時才顯示這份詳細報告)
         print(f"[PRODUCTION RESULTS] Advanced Residual MODWT-MoE")
-        print("="*80)
+        print("=" * 80)
 
         print(f"\n1. Overall Performance (Hybrid):")
         print(f"   RMSE:               {rmse_original:.4f}%")
         print(f"   MAE:                {mae_original:.4f}%")
         print(f"   R²:                 {r2_original:.4f}")
-        print(f"   Direction Accuracy: {true_direction_acc*100:.2f}%")
+        print(f"   Direction Accuracy: {true_direction_acc * 100:.2f}%")
 
         print(f"\n2. Ablation Analysis (Contribution):")
         print(f"   LSTM Base RMSE:     {rmse_base:.4f}%")
@@ -1465,13 +1477,14 @@ if __name__ == "__main__":
         print(f"\n3. Meta-Gate Statistics:")
         print(f"   Mean Alpha:         {test_alphas.mean():.4f}")
         print(f"   (High Alpha = Experts Active, Low Alpha = Base Active)")
-        
+
         # 只有在正常模式下才畫圖
         print("\n[Visualizations]")
         plot_training_curves(training_history, '../results/training_history.png')
-        plot_predictions(test_targets_original, test_preds_original, test_base_preds_original, '../results/predictions.png')
+        plot_predictions(test_targets_original, test_preds_original, test_base_preds_original,
+                         '../results/predictions.png')
         plot_gating_weights(test_gating_weights, test_targets_original, save_path='../results/gating_weights.png')
         plot_attention_maps(test_attention_weights, save_path='../results/attention_maps.png')
         plot_alpha_distribution(test_alphas, save_path='../results/alpha_dist.png')
 
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")

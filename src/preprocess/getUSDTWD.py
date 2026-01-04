@@ -2,6 +2,7 @@ import datetime
 import investpy
 import pandas as pd
 
+
 def Myinvestpy():
     """
     方法1: 使用investpy套件 (推薦)
@@ -15,7 +16,6 @@ def Myinvestpy():
         # 設定日期範圍
         start_date = "01/01/2000"  # investpy使用DD/MM/YYYY格式
         end_date = datetime.datetime.now().strftime("%d/%m/%Y")
-
 
         # 抓取USD/TWD歷史資料
         data = investpy.get_currency_cross_historical_data(
@@ -37,7 +37,7 @@ def Myinvestpy():
         print(f"資料範圍: {df['Date'].iloc[0]} 到 {df['Date'].iloc[-1]}")
 
         # 儲存為CSV
-        filename = f"../dataset/USD_TWD.csv"
+        filename = f"../../dataset/USD_TWD.csv"
         df.to_csv(filename, index=False, encoding='utf-8')
 
         print(f"資料已儲存至: {filename}")
