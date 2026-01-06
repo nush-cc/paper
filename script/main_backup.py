@@ -1348,7 +1348,7 @@ def plot_alpha_distribution(alphas, save_path='../results/alpha_dist.png'):
 
 # ==================== Main ====================
 if __name__ == "__main__":
-    os.makedirs('results', exist_ok=True)
+    os.makedirs('../results', exist_ok=True)
 
     RUN_MODE = "NORMAL"  # 可選：NORMAL, SANITY_INPUT_SHUFFLE, SANITY_TARGET_SHUFFLE
 
@@ -1358,7 +1358,7 @@ if __name__ == "__main__":
 
     # 1. Load data
     print("\n[Loading Data]")
-    df = pd.read_csv("dataset/USD_TWD.csv")
+    df = pd.read_csv("../dataset/USD_TWD.csv")
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     print(f"  Loaded {len(df)} days")

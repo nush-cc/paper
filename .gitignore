@@ -94,3 +94,6 @@ Thumbs.db
 *.7z
 
 drawio/
+
+# PyCharm debug helpers
+*-pycharm-support-libs/
