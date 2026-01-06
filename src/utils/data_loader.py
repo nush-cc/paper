@@ -28,28 +28,22 @@ def prepare_data(df, lookback=30, horizon=3, mode='raw'):
     split_idx = int(len(features) * 0.8)
     train_feat, test_feat = features[:split_idx], features[split_idx:]
 
-    scalers = {}
-    train_feat_scaled = np.zeros_like(train_feat)
-    test_feat_scaled = np.zeros_like(test_feat)
-
-    for i in range(features.shape[1]):
-        s = StandardScaler()
-        train_feat_scaled[:, i] = s.fit_transform(train_feat[:, i].reshape(-1, 1)).flatten()
-        test_feat_scaled[:, i] = s.transform(test_feat[:, i].reshape(-1, 1)).flatten()
-        if i == 0: scalers["target"] = s
-
     def create_sequences(data, lookback, horizon):
         X, y = [], []
         for i in range(len(data) - lookback - horizon + 1):
             X.append(data[i: i + lookback])
-            # y.append(data[i + lookback + horizon - 1, 0])
+            # 取出未來 horizon 的 Volatility (第 0 欄)
             y.append(data[i + lookback: i + lookback + horizon, 0])
         return np.array(X), np.array(y)
 
-    X_train, y_train = create_sequences(train_feat_scaled, lookback, horizon)
-    X_test, y_test = create_sequences(test_feat_scaled, lookback, horizon)
+    X_train, y_train = create_sequences(train_feat, lookback, horizon)
+    X_test, y_test = create_sequences(test_feat, lookback, horizon)
 
-    train_loader = DataLoader(VolatilityDataset(X_train, y_train), batch_size=32, shuffle=True)
-    test_loader = DataLoader(VolatilityDataset(X_test, y_test), batch_size=32, shuffle=False)
+    # 5. Loader (建議 drop_last=True)
+    train_loader = DataLoader(VolatilityDataset(X_train, y_train), batch_size=32, shuffle=True, drop_last=True)
+    test_loader = DataLoader(VolatilityDataset(X_test, y_test), batch_size=32, shuffle=False, drop_last=False)
+
+    # Scalers 回傳 None，因為已經不需要了
+    return train_loader, test_loader, None, X_train, y_train, X_test, y_test
 
     return train_loader, test_loader, scalers, X_train, y_train, X_test, y_test

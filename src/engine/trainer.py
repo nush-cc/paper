@@ -5,11 +5,18 @@ from src.models.network import EnhancedDLinear
 from src.utils.metrics import HybridDirectionalLoss
 
 
-def train_v11(train_loader, test_loader, device, horizon, num_epochs=120, lr=0.001, model_hyperparams=None):
+def train_v11(train_loader, test_loader, device, horizon, num_epochs=120, lr=0.001,
+              cnnExpert_KernelSize=5, seriesDecomposition_KernelSize=15,
+              model_hyperparams=None
+              ):
     if model_hyperparams is None:
         model_hyperparams = {}
 
-    model = EnhancedDLinear(seq_len=30, pred_len=horizon, input_channels=2, **model_hyperparams).to(device)
+    model = EnhancedDLinear(seq_len=30, pred_len=horizon, input_channels=2,
+                            seriesDecomposition_KernelSize=seriesDecomposition_KernelSize,
+                            cnnExpert_KernelSize=cnnExpert_KernelSize,
+                            **model_hyperparams
+                            ).to(device)
     criterion = HybridDirectionalLoss(direction_weight=0.5)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -48,4 +55,4 @@ def train_v11(train_loader, test_loader, device, horizon, num_epochs=120, lr=0.0
             print(
                 f"  Epoch {epoch + 1} | Loss: {np.mean(losses):.4f} | Trend W: {tr_w_val:.3f} | Seas W: {se_w_val:.3f}")
 
-            return model
+    return model
