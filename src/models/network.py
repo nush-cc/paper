@@ -9,6 +9,7 @@ class EnhancedDLinear(nn.Module):
     def __init__(self, seq_len, pred_len, input_channels,
                  use_cnn=True,  # <--- 這些是 init 的參數
                  use_decomp=True,
+                 use_revin=True,
                  hidden_dim=32,
                  cnnExpert_KernelSize=5,
                  seriesDecomposition_KernelSize=15
@@ -20,7 +21,12 @@ class EnhancedDLinear(nn.Module):
         self.pred_len = pred_len
         self.use_cnn = use_cnn
         self.use_decomp = use_decomp
-        self.revin = RevIN(num_features=input_channels)
+        self.use_revin = use_revin
+
+        if self.use_revin:
+            self.revin = RevIN(num_features=input_channels)
+        else:
+            self.revin = None
 
         # ==========================================
         #  區域 A: 建立層 (Building Layers)
@@ -45,19 +51,36 @@ class EnhancedDLinear(nn.Module):
             # Gating Weights
             self.trend_gate = nn.Parameter(torch.tensor(-0.01))
             self.seasonal_gate = nn.Parameter(torch.tensor(0.01))
+
+            self.trend_gate_net = nn.Sequential(
+                nn.Linear(seq_len * input_channels, 16),  # 先壓縮特徵
+                nn.Tanh(),  # 活化函數
+                nn.Linear(16, 1),  # 輸出一個純量權重
+                nn.Sigmoid()  # 限制在 0~1 之間 (代表信心程度)
+            )
+
+            self.seasonal_gate_net = nn.Sequential(
+                nn.Linear(seq_len * input_channels, 16),
+                nn.Tanh(),
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
         else:
             # 如果不開 CNN，就設為 None
             self.cnn_trend = None
             self.cnn_seasonal = None
             self.trend_gate = None
             self.seasonal_gate = None
+            self.trend_gate_net = None
+            self.seasonal_gate_net = None
 
     def forward(self, x):
         # ==========================================
         #  區域 B: 執行運算 (Execution)
         #  這裡只負責 "使用" 剛剛建立好的零件
         # ==========================================
-        x = self.revin(x, mode='norm')
+        if self.use_revin:
+            x = self.revin(x, mode='norm')
 
         # 1. Decomposition
         if self.use_decomp and self.decomp is not None:
@@ -85,6 +108,12 @@ class EnhancedDLinear(nn.Module):
             trend_out_cnn = self.cnn_trend(trend_part)
             seasonal_out_cnn = self.cnn_seasonal(seasonal_part)
 
+            # t_gate = self.trend_gate_net(trend_flat)  # Shape: (B, 1)
+            # s_gate = self.seasonal_gate_net(seasonal_flat)
+            #
+            # trend_cnn_final = t_gate * trend_out_cnn
+            # seasonal_cnn_final = s_gate * seasonal_out_cnn
+
             # Fusion with Gating
             trend_cnn_final = torch.tanh(self.trend_gate) * trend_out_cnn
             seasonal_cnn_final = torch.tanh(self.seasonal_gate) * seasonal_out_cnn
@@ -95,6 +124,9 @@ class EnhancedDLinear(nn.Module):
         final_output_norm = base_output_norm + cnn_correction
 
         def denorm_volatility(out_tensor):
+            if not self.use_revin:
+                return out_tensor
+
             out_tensor = out_tensor.unsqueeze(-1)  # [B, Pred, 1]
             out_tensor = self.revin(out_tensor, mode='denorm', target_idx=0)
             return out_tensor.squeeze(-1)

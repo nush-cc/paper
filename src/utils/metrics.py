@@ -5,7 +5,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 
 
 class HybridDirectionalLoss(nn.Module):
-    def __init__(self, direction_weight=0.5, delta=10.0):
+    def __init__(self, direction_weight=0.1, delta=10.0):
         super().__init__()
         self.huber = nn.HuberLoss(delta=delta, reduction='mean')
         self.dir_weight = direction_weight
