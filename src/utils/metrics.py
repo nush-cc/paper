@@ -5,19 +5,38 @@ from sklearn.metrics import mean_squared_error, r2_score
 
 
 class HybridDirectionalLoss(nn.Module):
-    def __init__(self, direction_weight=0.1, delta=10.0):
+    def __init__(self, delta=10.0, dir_weight=0.1, threshold=0.01):
         super().__init__()
         self.huber = nn.HuberLoss(delta=delta, reduction='mean')
-        self.dir_weight = direction_weight
+        self.dir_weight = dir_weight
+        self.threshold = threshold  # 設定一個極小值，忽略雜訊
 
     def forward(self, pred, target, prev_value):
+        # 1. 數值誤差 (Huber)
         loss_val = self.huber(pred, target)
+
+        # 2. 計算變化量
         true_delta = target - prev_value
         pred_delta = pred - prev_value
-        sign_agreement = torch.tanh(true_delta * 10) * torch.tanh(pred_delta * 10)
-        dir_loss = torch.mean(1 - sign_agreement)
-        return (1 - self.dir_weight) * loss_val + self.dir_weight * dir_loss
 
+        # 3. 製作遮罩 (Mask): 只有當真實變化夠大時，才在乎方向對不對
+        # abs(true_delta) > threshold 的部分才算分
+        mask = torch.abs(true_delta) > self.threshold
+        
+        if mask.sum() > 0:
+            # 使用 SoftMarginLoss (標準的方向分類 Loss)
+            # target 必須是 1 或 -1 (使用 sign)
+            # pred_delta 保持數值，讓模型知道"信心程度"
+            true_sign = torch.sign(true_delta[mask])
+            pred_val = pred_delta[mask]
+            
+            # SoftMarginLoss 公式: log(1 + exp(-y * x))
+            dir_loss = nn.functional.soft_margin_loss(pred_val, true_sign)
+        else:
+            dir_loss = torch.tensor(0.0, device=pred.device)
+
+        # 4. 總合
+        return (1 - self.dir_weight) * loss_val + self.dir_weight * dir_loss
 
 def get_metrics(targets, preds, last_knowns=None):
     """

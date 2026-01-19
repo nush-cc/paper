@@ -4,7 +4,7 @@ import numpy as np
 import src.utils.metrics as metrics
 
 
-def evaluate_model(model, test_loader, device, horizon):
+def evaluate_model(model, test_loader, device, horizon, scaler=None):
     model.eval()
 
     preds_base = []
@@ -35,6 +35,17 @@ def evaluate_model(model, test_loader, device, horizon):
     y_base = np.vstack(preds_base)
     y_last = np.vstack(last_knowns_all)
 
+    if scaler is not None:
+        # Volatility 是第 0 個特徵
+        # 公式: real = scaled * std + mean
+        vol_std = scaler.scale_[0]
+        vol_mean = scaler.mean_[0]
+        
+        y_true = y_true * vol_std + vol_mean
+        y_final = y_final * vol_std + vol_mean
+        y_base = y_base * vol_std + vol_mean
+        y_last = y_last * vol_std + vol_mean
+
     # 計算最後一筆數據作為 Naive 比較基準 (Optional)
     # 這裡假設你的 test_loader 有保留最後一筆 input，如果沒有可以傳入
     # 這裡先省略，專注於 Base vs Enhanced
@@ -50,7 +61,7 @@ def evaluate_model(model, test_loader, device, horizon):
     print("\n" + "=" * 95)
 
     if has_cnn:
-        print(f" FINAL MODEL EVALUATION (Horizon={horizon}): Ablation Study (RevIN Enabled)")
+        print(f" FINAL MODEL EVALUATION (Horizon={horizon}): Ablation Study")
         print("=" * 95)
         print(f"{'Metric':<20} | {'Linear Base':<15} | {'Base + CNN':<15} | {'Improvement':<15}")
         print("-" * 95)

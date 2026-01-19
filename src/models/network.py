@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from src.models.layers import SeriesDecomp, CNNExpert, RevIN
+from src.models.layers import SeriesDecomp, CNNExpert
 
 
 class EnhancedDLinear(nn.Module):
@@ -17,9 +17,9 @@ class EnhancedDLinear(nn.Module):
     def __init__(self, seq_len, pred_len, input_channels,
                  use_cnn=True,
                  use_decomp=True,
-                 use_revin=True,
                  hidden_dim=32,
-                 cnnExpert_KernelSize=5,
+                 trendCNNExpert_KernelSize=5,
+                 seasonalCNNExpert_KernelSize=5,
                  seriesDecomposition_KernelSize=15
                  ):
         super().__init__()
@@ -29,32 +29,25 @@ class EnhancedDLinear(nn.Module):
         self.pred_len = pred_len
         self.use_cnn = use_cnn
         self.use_decomp = use_decomp
-        self.use_revin = use_revin
         self.input_channels = input_channels
 
-        # 2. RevIN (可逆歸一化)
-        if self.use_revin:
-            self.revin = RevIN(num_features=input_channels)
-        else:
-            self.revin = None
-
-        # 3. Series Decomposition (序列分解)
+        # 2. Series Decomposition (序列分解)
         if self.use_decomp:
             # 建議在 layers.py 中將 SeriesDecomp 改為 LearnableMovingAvg 以獲得最佳效果
             self.decomp = SeriesDecomp(kernel_size=seriesDecomposition_KernelSize, input_channels=input_channels)
         else:
             self.decomp = None
 
-        # 4. Linear Backbone (DLinear 核心)
+        # 3. Linear Backbone (DLinear 核心)
         # 輸入必須攤平 (seq_len * channels)
         self.linear_trend = nn.Linear(seq_len * input_channels, pred_len)
         self.linear_seasonal = nn.Linear(seq_len * input_channels, pred_len)
 
-        # 5. CNN Booster & Hybrid Gating (混合閘門機制)
+        # 4. CNN Booster & Hybrid Gating (混合閘門機制)
         if self.use_cnn:
             # CNN Experts
-            self.cnn_trend = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, cnnExpert_KernelSize)
-            self.cnn_seasonal = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, cnnExpert_KernelSize)
+            self.cnn_trend = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, trendCNNExpert_KernelSize)
+            self.cnn_seasonal = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, seasonalCNNExpert_KernelSize)
 
             # --- [核心架構] Hybrid Residual Gating ---
 
@@ -94,11 +87,7 @@ class EnhancedDLinear(nn.Module):
     def forward(self, x):
         # x shape: [Batch, Seq_Len, Channels]
 
-        # 1. RevIN Normalization
-        if self.use_revin:
-            x = self.revin(x, mode='norm')
-
-        # 2. Series Decomposition
+        # 1. Series Decomposition
         if self.use_decomp and self.decomp is not None:
             seasonal_part, trend_part = self.decomp(x)
         else:
@@ -111,14 +100,14 @@ class EnhancedDLinear(nn.Module):
         trend_flat = trend_part.reshape(B, -1)
         seasonal_flat = seasonal_part.reshape(B, -1)
 
-        # 3. Linear Backbone Prediction
+        # 2. Linear Backbone Prediction
         trend_out_linear = self.linear_trend(trend_flat)
         seasonal_out_linear = self.linear_seasonal(seasonal_flat)
 
         # 基礎預測結果
         base_output_norm = trend_out_linear + seasonal_out_linear
 
-        # 4. CNN Expert Correction (with Hybrid Gating)
+        # 3. CNN Expert Correction (with Hybrid Gating)
         cnn_correction = 0.0
         weights_to_return = None  # 預設回傳值
 
@@ -151,25 +140,9 @@ class EnhancedDLinear(nn.Module):
             # 回傳 batch 的平均權重，方便在訓練 log 中觀察變化
             weights_to_return = torch.stack([t_gate.mean(), s_gate.mean()])
 
-        # 5. 最終加總
+        # 4. 最終加總
         final_output_norm = base_output_norm + cnn_correction
 
-        # 6. Denormalization (還原)與輸出處理
-        def denorm_volatility(out_tensor):
-            """Helper function to denormalize output"""
-            if not self.use_revin:
-                return out_tensor
-            # RevIN 需要 [B, Len, C] 的形狀
-            out_tensor = out_tensor.unsqueeze(-1)
-            # 這裡假設我們要預測的是 target_idx=0 (通常是 Close Price 或 Volatility)
-            # 確保你的 RevIN denorm 邏輯與 metrics.py 中的一致
-            out_tensor = self.revin(out_tensor, mode='denorm', target_idx=0)
-            return out_tensor.squeeze(-1)
-
-        output_final = denorm_volatility(final_output_norm)
-        output_base = denorm_volatility(base_output_norm)
-
-        # output_final: 模型最終預測 (Linear + CNN)
-        # output_base: 僅 Linear 的預測 (用來做 Ablation 比較)
-        # weights_to_return: 閘門權重 (用來做論文分析)
-        return output_final, output_base, weights_to_return
+        # 5. 輸出處理
+        # 後續會在 evaluator.py 中透過 scaler 還原回真實數值
+        return final_output_norm, base_output_norm, weights_to_return
