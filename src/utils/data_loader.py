@@ -45,5 +45,3 @@ def prepare_data(df, lookback=30, horizon=3, mode='raw'):
 
     # Scalers 回傳 None，因為已經不需要了
     return train_loader, test_loader, None, X_train, y_train, X_test, y_test
-
-    return train_loader, test_loader, scalers, X_train, y_train, X_test, y_test

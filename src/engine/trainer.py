@@ -5,14 +5,14 @@ from src.models.network import EnhancedDLinear
 from src.utils.metrics import HybridDirectionalLoss
 
 
-def train_v11(train_loader, test_loader, device, horizon, num_epochs=120, lr=0.001,
+def train_v11(train_loader, test_loader, device, horizon, seq_len=60, num_epochs=120, lr=0.001,
               cnnExpert_KernelSize=5, seriesDecomposition_KernelSize=15,
               model_hyperparams=None
               ):
     if model_hyperparams is None:
         model_hyperparams = {}
 
-    model = EnhancedDLinear(seq_len=30, pred_len=horizon, input_channels=2,
+    model = EnhancedDLinear(seq_len=seq_len, pred_len=horizon, input_channels=2,
                             seriesDecomposition_KernelSize=seriesDecomposition_KernelSize,
                             cnnExpert_KernelSize=cnnExpert_KernelSize,
                             **model_hyperparams

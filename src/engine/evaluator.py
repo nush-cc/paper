@@ -82,5 +82,6 @@ def evaluate_model(model, test_loader, device, horizon):
         "RMSE_Final": rmse_f,
         "RMSE_Base": rmse_b,
         "R2_Final": r2_f,
+        "Avg_Acc": acc_f,
         "High_Vol_Acc": h_acc_f
     }

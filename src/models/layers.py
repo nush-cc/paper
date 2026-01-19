@@ -11,7 +11,9 @@ class LearnableMovingAvg(nn.Module):
             kernel_size=kernel_size,
             padding=(kernel_size - 1) // 2,
             groups=input_channels,
-            bias=False
+            bias=False,
+            padding_mode='replicate'
+
         )
         nn.init.constant_(self.conv.weight, 1.0 / kernel_size)
 
@@ -43,8 +45,8 @@ class FixedMovingAvg(nn.Module):
 class SeriesDecomp(nn.Module):
     def __init__(self, kernel_size, input_channels):
         super(SeriesDecomp, self).__init__()
-        # self.moving_avg = LearnableMovingAvg(kernel_size, input_channels)
-        self.moving_avg = FixedMovingAvg(kernel_size)
+        self.moving_avg = LearnableMovingAvg(kernel_size, input_channels)
+        # self.moving_avg = FixedMovingAvg(kernel_size)
 
     def forward(self, x):
         trend = self.moving_avg(x)
