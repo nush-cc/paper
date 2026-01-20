@@ -13,7 +13,7 @@ def evaluate_model(model, test_loader, device, horizon, scaler=None):
     last_knowns_all = []
 
     # 判斷是否為混合模型 (用於顯示不同報表)
-    has_cnn = getattr(model, 'use_cnn', False)
+    has_cnn = getattr(model, 'use_seasonal_cnn', False)
 
     with torch.no_grad():
         for batch in test_loader:

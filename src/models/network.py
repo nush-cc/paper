@@ -15,7 +15,6 @@ class EnhancedDLinear(nn.Module):
     """
 
     def __init__(self, seq_len, pred_len, input_channels,
-                 use_cnn=True,
                  use_seasonal_cnn=True,
                  use_trend_cnn=False,
                  use_decomp=True,
@@ -29,7 +28,6 @@ class EnhancedDLinear(nn.Module):
         # 1. 保存設定參數
         self.seq_len = seq_len
         self.pred_len = pred_len
-        self.use_cnn = use_cnn
         self.use_decomp = use_decomp
         self.input_channels = input_channels
         self.use_seasonal_cnn = use_seasonal_cnn
@@ -48,56 +46,21 @@ class EnhancedDLinear(nn.Module):
         self.linear_seasonal = nn.Linear(seq_len * input_channels, pred_len)
 
         # 4. CNN Booster & Hybrid Gating (混合閘門機制)
-        if self.use_cnn:
-            # CNN Experts
-            self.cnn_trend = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, trendCNNExpert_KernelSize)
-            self.cnn_seasonal = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, seasonalCNNExpert_KernelSize)
-
-            # --- [核心架構] Hybrid Residual Gating ---
-
-            # A. 靜態基底 (Static Base):
-            # 透過 nn.Parameter 學習一個全域最佳的 "底薪"。
-            # 初始設為 0.0，經過 Sigmoid 後約為 0.5 (中立)，讓模型自己去調整。
-            self.trend_base = nn.Parameter(torch.tensor(-1.0))
-            self.seasonal_base = nn.Parameter(torch.tensor(-1.0))
-
-            # B. 動態微調網路 (Dynamic Delta Net):
-            # 負責根據輸入特徵計算 "績效獎金" (微調量)。
-            # 使用瓶頸設計 (Bottleneck): 輸入 -> 8 -> 1，強迫過濾雜訊。
-            self.gate_input_dim = seq_len * input_channels
-
-            self.trend_delta_net = nn.Sequential(
-                nn.Linear(self.gate_input_dim, 8),  # 降維壓縮
-                nn.ReLU(),
-                nn.Linear(8, 1),
-                nn.Tanh()  # 輸出範圍 -1 ~ 1，代表增強或減弱
-            )
-
-            self.seasonal_delta_net = nn.Sequential(
-                nn.Linear(self.gate_input_dim, 8),
-                nn.ReLU(),
-                nn.Linear(8, 1),
-                nn.Tanh()
-            )
-        else:
-            # 如果不使用 CNN，將相關元件設為 None
-            self.cnn_trend = None
-            self.cnn_seasonal = None
-            self.trend_base = None
-            self.seasonal_base = None
-            self.trend_delta_net = None
-            self.seasonal_delta_net = None
+        
 
         if self.use_trend_cnn:
+            print("Trend CNN Expert Enabled")
             self.cnn_trend = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, trendCNNExpert_KernelSize)
             self.trend_base = nn.Parameter(torch.tensor(-1.0)) # 初始權重低
             self.trend_delta_net = nn.Sequential(...) # 同原本
         else:
+            print("Trend CNN Expert Disabled")
             self.cnn_trend = None
             self.trend_base = None
             self.trend_delta_net = None
 
         if self.use_seasonal_cnn:
+            print("Seasonal CNN Expert Enabled")
             self.cnn_seasonal = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, seasonalCNNExpert_KernelSize)
             
             # [關鍵修改]：將 Base 初始化提高，強迫模型在初期重視它
@@ -112,6 +75,7 @@ class EnhancedDLinear(nn.Module):
                 nn.Tanh()
             )
         else:
+            print("Seasonal CNN Expert Disabled")
             self.cnn_seasonal = None
             self.seasonal_base = None
             self.seasonal_delta_net = None

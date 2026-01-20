@@ -41,7 +41,7 @@ def train_v11(
     )
 
     best_val_loss = float("inf")
-    patience = 20 
+    patience = 20
     counter = 0
 
     print("\n[Training] Enhanced DLinear...")
@@ -62,6 +62,7 @@ def train_v11(
 
             loss = criterion(out, y, prev_val)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             losses.append(loss.item())
 
@@ -91,14 +92,11 @@ def train_v11(
 
         # === 3. Logging & Early Stopping ===
         # 印出當前狀態 (包含權重資訊)
-        # if (epoch + 1) % 10 == 0 or epoch == 0:
-        #     print(f"Epoch {epoch + 1:3d} | Train: {train_loss:.4f} | Val: {avg_val_loss:.4f} | Trend W: {t_w:.3f} | Seas W: {s_w:.3f}")
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch + 1:3d} | ... | LR: {current_lr:.6f}")
-
-        print(
-            f"Epoch {epoch + 1:3d} | Train: {train_loss:.4f} | Val: {avg_val_loss:.4f} | Trend W: {t_w:.3f} | Seas W: {s_w:.3f}"
-        )
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(
+                f"Epoch {epoch + 1:3d} | LR: {current_lr:.6f} | Train: {train_loss:.4f} | Val: {avg_val_loss:.4f} | Trend W: {t_w:.3f} | Seas W: {s_w:.3f}"
+            )
 
         # Checkpoint logic
         if avg_val_loss < best_val_loss:
