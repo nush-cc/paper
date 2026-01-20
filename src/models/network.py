@@ -120,8 +120,8 @@ class EnhancedDLinear(nn.Module):
 
             # Step A: 計算動態 Delta (限制幅度)
             # 乘上 0.2 是為了限制動態網路的權限 (Residual Scaling)，防止過擬合
-            delta_t = self.trend_delta_net(trend_flat) * 0.2
-            delta_s = self.seasonal_delta_net(seasonal_flat) * 0.2
+            delta_t = self.trend_delta_net(trend_flat)
+            delta_s = self.seasonal_delta_net(seasonal_flat)
 
             # Step B: 結合靜態與動態 (Base + Delta)
             # 使用 Sigmoid 確保最終權重在 0~1 之間 (融合比例)

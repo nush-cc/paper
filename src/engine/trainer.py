@@ -36,11 +36,11 @@ def train_v11(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.1, patience=3
+        optimizer, mode="min", factor=0.5, patience=10, threshold=0.001, min_lr=1e-5
     )
 
     best_val_loss = float("inf")
-    patience = 10  # 容忍 10 個 Epoch 不進步
+    patience = 15  # 容忍 10 個 Epoch 不進步
     counter = 0
 
     print("\n[Training] Enhanced DLinear...")
@@ -92,6 +92,8 @@ def train_v11(
         # 印出當前狀態 (包含權重資訊)
         # if (epoch + 1) % 10 == 0 or epoch == 0:
         #     print(f"Epoch {epoch + 1:3d} | Train: {train_loss:.4f} | Val: {avg_val_loss:.4f} | Trend W: {t_w:.3f} | Seas W: {s_w:.3f}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch + 1:3d} | ... | LR: {current_lr:.6f}")
 
         print(
             f"Epoch {epoch + 1:3d} | Train: {train_loss:.4f} | Val: {avg_val_loss:.4f} | Trend W: {t_w:.3f} | Seas W: {s_w:.3f}"

@@ -50,7 +50,18 @@ def evaluate_model(model, test_loader, device, horizon, scaler=None):
     # 這裡假設你的 test_loader 有保留最後一筆 input，如果沒有可以傳入
     # 這裡先省略，專注於 Base vs Enhanced
 
-    # --- 計算指標 ---
+    y_naive = np.tile(y_last, (1, horizon))
+
+    # 計算 Naive 的指標
+    metrics_naive = metrics.get_metrics(y_true, y_naive, y_last)
+    r2_naive, rmse_naive, _, _, _ = metrics_naive
+    
+    print(f" Naive Baseline (Persistance Model)")
+    print("-" * 60)
+    print(f" RMSE: {rmse_naive:.4f} | R2: {r2_naive:.4f}")
+    print("-" * 60)
+
+    # --- 計算 Base 與 Final 指標 (原本的程式碼) ---
     metrics_base = metrics.get_metrics(y_true, y_base, y_last)
     metrics_final = metrics.get_metrics(y_true, y_final, y_last)
 
