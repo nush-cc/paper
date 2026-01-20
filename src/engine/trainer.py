@@ -33,14 +33,15 @@ def train_v11(
     ).to(device)
 
     criterion = HybridDirectionalLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10, threshold=0.001, min_lr=1e-5
+        optimizer, mode="min", factor=0.5, patience=5, threshold=0.001, min_lr=1e-5
     )
 
     best_val_loss = float("inf")
-    patience = 15  # 容忍 10 個 Epoch 不進步
+    patience = 20 
     counter = 0
 
     print("\n[Training] Enhanced DLinear...")

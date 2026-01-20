@@ -5,7 +5,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 
 
 class HybridDirectionalLoss(nn.Module):
-    def __init__(self, delta=10.0, dir_weight=0.1, threshold=0.01):
+    def __init__(self, delta=1.0, dir_weight=0.5, threshold=0.01):
         super().__init__()
         self.huber = nn.HuberLoss(delta=delta, reduction='mean')
         self.dir_weight = dir_weight
@@ -37,6 +37,57 @@ class HybridDirectionalLoss(nn.Module):
 
         # 4. 總合
         return (1 - self.dir_weight) * loss_val + self.dir_weight * dir_loss
+
+# class HybridDirectionalLoss(nn.Module):
+#     def __init__(self, delta=1.0, dir_weight=0.5, threshold=0.01, tanh_scale=5.0):
+#         """
+#         Args:
+#             delta: Huber Loss 的閾值
+#             dir_weight: 方向性 Loss 的權重
+#             threshold: 忽略微小變化的門檻
+#             tanh_scale: Tanh 的放大倍率 (溫度係數)。
+#                         因為 Tanh 在 0 附近很平緩，如果 pred_delta 很小 (如 0.05)，
+#                         tanh(0.05) ~= 0.05，還不夠接近 1 或 -1。
+#                         乘上 scale (如 5) 變成 tanh(0.25)，能強迫模型表態。
+#         """
+#         super().__init__()
+#         self.huber = nn.HuberLoss(delta=delta, reduction='mean')
+#         self.dir_weight = dir_weight
+#         self.threshold = threshold
+#         self.tanh_scale = tanh_scale  # <--- 新增這個參數
+
+#     def forward(self, pred, target, prev_value):
+#         # 1. 數值誤差 (Huber) - 負責 "準不準"
+#         loss_val = self.huber(pred, target)
+
+#         # 2. 計算變化量
+#         true_delta = target - prev_value
+#         pred_delta = pred - prev_value
+
+#         # 3. 製作遮罩 (Mask)
+#         mask = torch.abs(true_delta) > self.threshold
+        
+#         if mask.sum() > 0:
+#             # 取出需要計算方向的樣本
+#             true_sign = torch.sign(true_delta[mask]) # +1 或 -1
+#             pred_delta_masked = pred_delta[mask]
+
+#             # --- [修改重點] 使用 Tanh 模擬 Soft Sign ---
+            
+#             # A. 使用 Tanh 壓縮預測值到 [-1, 1]
+#             # 乘上 scale 是為了讓靠近 0 的微小變化也能被放大成明確的方向
+#             pred_sign_approx = torch.tanh(pred_delta_masked * self.tanh_scale)
+
+#             # B. 計算方向一致性
+#             # 如果同號: 1 * 1 = 1 或 -1 * -1 = 1 -> Loss = 1 - 1 = 0
+#             # 如果異號: 1 * -1 = -1 -> Loss = 1 - (-1) = 2
+#             dir_loss = torch.mean(1 - (pred_sign_approx * true_sign))
+            
+#         else:
+#             dir_loss = torch.tensor(0.0, device=pred.device)
+
+#         # 4. 總合
+#         return (1 - self.dir_weight) * loss_val + self.dir_weight * dir_loss
 
 def get_metrics(targets, preds, last_knowns=None):
     """

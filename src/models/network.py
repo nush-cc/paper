@@ -16,6 +16,8 @@ class EnhancedDLinear(nn.Module):
 
     def __init__(self, seq_len, pred_len, input_channels,
                  use_cnn=True,
+                 use_seasonal_cnn=True,
+                 use_trend_cnn=False,
                  use_decomp=True,
                  hidden_dim=32,
                  trendCNNExpert_KernelSize=5,
@@ -30,6 +32,8 @@ class EnhancedDLinear(nn.Module):
         self.use_cnn = use_cnn
         self.use_decomp = use_decomp
         self.input_channels = input_channels
+        self.use_seasonal_cnn = use_seasonal_cnn
+        self.use_trend_cnn = use_trend_cnn
 
         # 2. Series Decomposition (序列分解)
         if self.use_decomp:
@@ -84,65 +88,90 @@ class EnhancedDLinear(nn.Module):
             self.trend_delta_net = None
             self.seasonal_delta_net = None
 
+        if self.use_trend_cnn:
+            self.cnn_trend = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, trendCNNExpert_KernelSize)
+            self.trend_base = nn.Parameter(torch.tensor(-1.0)) # 初始權重低
+            self.trend_delta_net = nn.Sequential(...) # 同原本
+        else:
+            self.cnn_trend = None
+            self.trend_base = None
+            self.trend_delta_net = None
+
+        if self.use_seasonal_cnn:
+            self.cnn_seasonal = CNNExpert(seq_len, pred_len, input_channels, hidden_dim, seasonalCNNExpert_KernelSize)
+            
+            # [關鍵修改]：將 Base 初始化提高，強迫模型在初期重視它
+            # -1.0 -> sigmoid ~ 0.26
+            #  0.0 -> sigmoid = 0.50
+            self.seasonal_base = nn.Parameter(torch.tensor(0.0)) 
+            
+            self.seasonal_delta_net = nn.Sequential(
+                nn.Linear(seq_len * input_channels, 8),
+                nn.ReLU(),
+                nn.Linear(8, 1),
+                nn.Tanh()
+            )
+        else:
+            self.cnn_seasonal = None
+            self.seasonal_base = None
+            self.seasonal_delta_net = None
+
     def forward(self, x):
         # x shape: [Batch, Seq_Len, Channels]
 
-        # 1. Series Decomposition
+        # === 1. Series Decomposition ===
         if self.use_decomp and self.decomp is not None:
             seasonal_part, trend_part = self.decomp(x)
         else:
-            # Fallback: 如果不分解，假設全是趨勢
+            # Fallback: 若無分解，假設全是 Trend (或視需求調整)
             seasonal_part = torch.zeros_like(x)
             trend_part = x
 
-        # 準備攤平的特徵供 Linear 和 Gating 使用
+        # 準備 Flatten 特徵
         B, S, C = x.shape
         trend_flat = trend_part.reshape(B, -1)
         seasonal_flat = seasonal_part.reshape(B, -1)
 
-        # 2. Linear Backbone Prediction
+        # === 2. Linear Backbone Prediction (基底) ===
         trend_out_linear = self.linear_trend(trend_flat)
         seasonal_out_linear = self.linear_seasonal(seasonal_flat)
-
-        # 基礎預測結果
+        
         base_output_norm = trend_out_linear + seasonal_out_linear
 
-        # 3. CNN Expert Correction (with Hybrid Gating)
+        # === 3. CNN Expert Correction (分工處理) ===
         cnn_correction = 0.0
-        weights_to_return = None  # 預設回傳值
+        
+        # 預設回傳權重 (用於 Log 監控)，沒開的部分補 0
+        t_weight_val = torch.tensor(0.0, device=x.device)
+        s_weight_val = torch.tensor(0.0, device=x.device)
 
-        if self.use_cnn and self.cnn_trend is not None:
-            # CNN 特徵提取
+        # Part A: Trend CNN (如果開啟才跑)
+        if self.use_trend_cnn and self.cnn_trend is not None:
             trend_out_cnn = self.cnn_trend(trend_part)
-            seasonal_out_cnn = self.cnn_seasonal(seasonal_part)
-
-            # --- 計算混合權重 ---
-
-            # Step A: 計算動態 Delta (限制幅度)
-            # 乘上 0.2 是為了限制動態網路的權限 (Residual Scaling)，防止過擬合
             delta_t = self.trend_delta_net(trend_flat)
-            delta_s = self.seasonal_delta_net(seasonal_flat)
-
-            # Step B: 結合靜態與動態 (Base + Delta)
-            # 使用 Sigmoid 確保最終權重在 0~1 之間 (融合比例)
             t_gate = torch.sigmoid(self.trend_base + delta_t)
+            
+            cnn_correction = cnn_correction + (t_gate * trend_out_cnn)
+            t_weight_val = t_gate.mean()
+
+        # Part B: Seasonal CNN (重點部分)
+        if self.use_seasonal_cnn and self.cnn_seasonal is not None:
+            seasonal_out_cnn = self.cnn_seasonal(seasonal_part)
+            
+            # 計算動態權重
+            delta_s = self.seasonal_delta_net(seasonal_flat)
+            
+            # 融合 Static Base + Dynamic Delta
             s_gate = torch.sigmoid(self.seasonal_base + delta_s)
+            
+            # 加權並累加到修正量
+            cnn_correction = cnn_correction + (s_gate * seasonal_out_cnn)
+            s_weight_val = s_gate.mean()
 
-            # Step C: 加權融合 (Gated Fusion)
-            # t_gate [B, 1] * trend_out_cnn [B, Pred] -> Broadcast
-            trend_cnn_final = t_gate * trend_out_cnn
-            seasonal_cnn_final = s_gate * seasonal_out_cnn
-
-            # Step D: 加總 CNN 修正量
-            cnn_correction = trend_cnn_final + seasonal_cnn_final
-
-            # Step E: 紀錄權重供分析
-            # 回傳 batch 的平均權重，方便在訓練 log 中觀察變化
-            weights_to_return = torch.stack([t_gate.mean(), s_gate.mean()])
-
-        # 4. 最終加總
+        # === 4. Final Output ===
         final_output_norm = base_output_norm + cnn_correction
 
-        # 5. 輸出處理
-        # 後續會在 evaluator.py 中透過 scaler 還原回真實數值
+        # 堆疊權重回傳 [Trend_W, Seasonal_W]
+        weights_to_return = torch.stack([t_weight_val, s_weight_val])
+
         return final_output_norm, base_output_norm, weights_to_return

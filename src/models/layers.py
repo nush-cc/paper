@@ -60,7 +60,7 @@ class CNNExpert(nn.Module):
 
         # Params needed for tuning
         k_size = cnnExpert_KernelSize  # <--- 在這裡修改 Kernel Size (3, 5, 7...)
-        dropout_p = 0.2  # <--- 在這裡修改 Dropout (0.1 ~ 0.5)
+        dropout_p = 0.35  # <--- 在這裡修改 Dropout (0.1 ~ 0.5)
 
         # 自動計算 Padding (保證輸入輸出長度一致：30 -> 30)
         # 公式：(kernel_size - 1) // 2
