@@ -1,4 +1,5 @@
 import datetime
+
 import investpy
 import pandas as pd
 
@@ -19,7 +20,7 @@ def Myinvestpy():
 
         # 抓取USD/TWD歷史資料
         data = investpy.get_currency_cross_historical_data(
-            currency_cross='USD/TWD',
+            currency_cross='AUD/TWD',
             from_date=start_date,
             to_date=end_date,
         )
@@ -37,7 +38,7 @@ def Myinvestpy():
         print(f"資料範圍: {df['Date'].iloc[0]} 到 {df['Date'].iloc[-1]}")
 
         # 儲存為CSV
-        filename = f"../../dataset/USD_TWD.csv"
+        filename = f"dataset/AUD_TWD.csv"
         df.to_csv(filename, index=False, encoding='utf-8')
 
         print(f"資料已儲存至: {filename}")

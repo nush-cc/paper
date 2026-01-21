@@ -1,5 +1,5 @@
-import torch.nn as nn
 import torch
+import torch.nn as nn
 
 
 class LearnableMovingAvg(nn.Module):
@@ -43,10 +43,15 @@ class FixedMovingAvg(nn.Module):
 
 
 class SeriesDecomp(nn.Module):
-    def __init__(self, kernel_size, input_channels):
+    def __init__(self, kernel_size, input_channels, use_learnable=True):
         super(SeriesDecomp, self).__init__()
-        self.moving_avg = LearnableMovingAvg(kernel_size, input_channels)
-        # self.moving_avg = FixedMovingAvg(kernel_size)
+
+        if use_learnable:
+            print("Learnable Moving Average Decomposition Enabled")
+            self.moving_avg = LearnableMovingAvg(kernel_size, input_channels)
+        else:
+            print("Fixed Moving Average Decomposition Enabled")
+            self.moving_avg = FixedMovingAvg(kernel_size)
 
     def forward(self, x):
         trend = self.moving_avg(x)

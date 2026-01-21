@@ -148,3 +148,33 @@ def get_metrics(targets, preds, last_knowns=None):
             acc_high = 0.0
 
     return r2, rmse, acc_avg, acc_steps, acc_high
+
+
+def get_sharpe_ratio(targets, preds, last_knowns, annual_factor=252):
+    """
+    計算基於方向預測的模擬交易夏普值 (日資料預設 252)
+    """
+    if last_knowns is None:
+        return 0.0
+    
+    if last_knowns.ndim == 1:
+        last_knowns = last_knowns.reshape(-1, 1)
+
+    # 1. 取得預測方向與實際報酬率
+    # 我們以 Horizon 的第一步 (t+1) 作為交易基準，這是最實務的做法
+    true_delta_pct = (targets[:, 0] - last_knowns[:, 0]) / last_knowns[:, 0]
+    pred_direction = np.sign(preds[:, 0] - last_knowns[:, 0])
+
+    # 2. 計算策略日報酬
+    # 方向正確得正報酬，方向錯誤得負報酬
+    strategy_returns = pred_direction * true_delta_pct
+
+    # 3. 計算 Sharpe Ratio
+    avg_ret = np.mean(strategy_returns)
+    std_ret = np.std(strategy_returns)
+
+    if std_ret < 1e-9: # 防止除以 0
+        return 0.0
+
+    sharpe = (avg_ret / std_ret) * np.sqrt(annual_factor)
+    return sharpe

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from src.models.layers import SeriesDecomp, CNNExpert
+
+from src.models.layers import CNNExpert, SeriesDecomp
 
 
 class EnhancedDLinear(nn.Module):
@@ -18,6 +19,7 @@ class EnhancedDLinear(nn.Module):
                  use_seasonal_cnn=True,
                  use_trend_cnn=False,
                  use_decomp=True,
+                 use_learnable=True,
                  hidden_dim=32,
                  trendCNNExpert_KernelSize=5,
                  seasonalCNNExpert_KernelSize=5,
@@ -32,11 +34,13 @@ class EnhancedDLinear(nn.Module):
         self.input_channels = input_channels
         self.use_seasonal_cnn = use_seasonal_cnn
         self.use_trend_cnn = use_trend_cnn
+        self.use_learnable = use_learnable
+        
 
         # 2. Series Decomposition (序列分解)
         if self.use_decomp:
             # 建議在 layers.py 中將 SeriesDecomp 改為 LearnableMovingAvg 以獲得最佳效果
-            self.decomp = SeriesDecomp(kernel_size=seriesDecomposition_KernelSize, input_channels=input_channels)
+            self.decomp = SeriesDecomp(kernel_size=seriesDecomposition_KernelSize, input_channels=input_channels, use_learnable=use_learnable)
         else:
             self.decomp = None
 
