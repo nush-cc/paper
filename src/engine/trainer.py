@@ -1,5 +1,5 @@
-import torch
 import numpy as np
+import torch
 
 from src.models.network import EnhancedDLinear
 from src.utils.metrics import HybridDirectionalLoss
@@ -58,7 +58,7 @@ def train_v11(
             prev_val = x[:, -1, 0:1]
 
             # 接收回傳的權重 (out, base, weights)
-            out, _, gate_weights = model(x)
+            out, _, gate_weights, _, _ = model(x)
 
             loss = criterion(out, y, prev_val)
             loss.backward()
@@ -78,7 +78,7 @@ def train_v11(
             for batch in val_loader:
                 x, y = batch["raw_input"].to(device), batch["target"].to(device)
                 prev_val = x[:, -1, 0:1]
-                out, _, _ = model(x)
+                out, _, _, _, _ = model(x)
                 loss = criterion(out, y, prev_val)
                 val_losses.append(loss.item())
 

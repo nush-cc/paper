@@ -56,7 +56,7 @@ class SeriesDecomp(nn.Module):
     def forward(self, x):
         trend = self.moving_avg(x)
         seasonal = x - trend
-        return seasonal, trend
+        return trend, seasonal
 
 
 class CNNExpert(nn.Module):
